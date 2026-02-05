@@ -30,7 +30,7 @@
 
     - name: Generate HTML report from template
       ansible.builtin.template:
-        src: wso2_log_report.html.j2
+        src: log-report.html.j2
         dest: /opt/wso2/email_reports/log_cleanup_report.html
         #dest: /opt/wso2/test_email_reports/log_cleanup_report.html
 
