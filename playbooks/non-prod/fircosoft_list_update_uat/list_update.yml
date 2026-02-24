@@ -24,6 +24,7 @@
     mail_from: "croansible@fnb.co.za"
     mail_to:
       - "tienie.vanrooyen@fnb.co.za"
+      - "fnbregappsupport@fnb.co.za"
     mail_subject_prefix: "UAT Firco Pipeline"
 
     pipeline:
