@@ -1,0 +1,86 @@
+---
+- name: Verify internet egress via NTLM proxy from Windows host (no WinHTTP change)
+  hosts: windows_uat
+  gather_facts: no
+
+  vars:
+    proxy_host: "htf-cobbler.fnb.co.za"
+    proxy_port: 8080
+    proxy_url: "http://{{ proxy_host }}:{{ proxy_port }}"
+    proxy_domain: "FNBJNB01"
+    proxy_user: "SVC_cro_ansible_dev"
+    proxy_username_qualified: "{{ proxy_domain }}\\{{ proxy_user }}"
+    proxy_password: "InwxvJ.NWkaYf*1s"
+    test_url: "https://www.google.com/robots.txt"
+    test_download_path: "C:\\Temp\\robots.txt"
+
+  tasks:
+    - name: Ensure C:\Temp exists
+      ansible.windows.win_file:
+        path: "C:\\Temp"
+        state: directory
+
+    - name: Test HTTP via NTLM proxy (Invoke-WebRequest with explicit proxy+creds)
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $u = "{{ proxy_username_qualified }}"
+          $p = "{{ proxy_password }}"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential($u, $sec)
+
+          $out = "{{ test_download_path }}"
+          $uri = "{{ test_url }}"
+          $resp = Invoke-WebRequest -Uri $uri -OutFile $out -Proxy "{{ proxy_url }}" -ProxyCredential $cred -UseBasicParsing -PassThru
+
+          [PSCustomObject]@{
+            StatusCode = $resp.StatusCode
+            Length     = (Get-Item $out).Length
+            SavedTo    = $out
+          }
+      register: proxy_test
+
+    - name: Show proxy test result
+      ansible.builtin.debug:
+        var: proxy_test.stdout_lines
+- name: Original connectivity and file checks
+  hosts: windows_uat
+  gather_facts: no
+  tasks:
+    - name: Ping Windows host
+      ansible.windows.win_ping:
+
+    - name: Get current date and time
+      ansible.windows.win_shell: date
+      register: date_output
+
+    - name: Show current date and time
+      ansible.builtin.debug:
+        msg: "{{ date_output.stdout }}"
+
+    - name: Get Windows OS version
+      ansible.windows.win_shell: "(Get-CimInstance Win32_OperatingSystem).Version"
+      register: os_output
+
+    - name: Show Windows OS version
+      ansible.builtin.debug:
+        msg: "{{ os_output.stdout }}"
+
+    - name: Find files under D:\COMMANDS
+      ansible.windows.win_find:
+        paths: ['D:\COMMANDS']
+        file_type: file
+        recurse: yes
+        patterns: ['*.txt']
+      register: found_files
+
+    - name: Show file paths
+      ansible.builtin.debug:
+        msg: "{{ found_files.files | default([]) | map(attribute='path') | list }}"
+
+    - name: Show path and size in MB
+      ansible.builtin.debug:
+        msg: "{{ item.path }} — {{ (item.size | float / (1024*1024)) | round(2) }} MB"
+      loop: "{{ found_files.files | default([]) }}"
