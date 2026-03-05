@@ -20,7 +20,7 @@
 
     smtp_host: "mail.fnb.co.za"
     smtp_port: 25
-    smtp_secure: "starttls"
+    smtp_secure: "never"
     mail_from: "croansible@fnb.co.za"
     mail_to:
       - "tienie.vanrooyen@fnb.co.za"
