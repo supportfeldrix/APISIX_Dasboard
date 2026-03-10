@@ -1,0 +1,154 @@
+---
+- name: Podman container health - HTML report & email
+  hosts: localhost
+  connection: local
+  gather_facts: yes   # to get ansible_date_time and ansible_hostname
+
+  vars:
+    # ==== Report / Email settings ====
+    report_title: "Podman Container Health"
+    report_path: "/tmp/podman_health_{{ ansible_date_time.iso8601_basic }}.html"
+
+    notify_enabled: true               # set true to send email
+    notify_to:
+      - "tienie.vanrooyen@fnb.co.za"        # TODO: update recipients
+      - "Nico.Modiba@fnb.co.za"
+    notify_cc: []                       # optional
+    notify_subject: "{{ report_title }} - {{ ansible_hostname }} - {{ ansible_date_time.date }} {{ ansible_date_time.time }}"
+    use_local_mta: false                # true = use local sendmail/postfix; false = use SMTP below
+    smtp_host: "mail.fnb.co.za"
+    smtp_port: 25
+    smtp_starttls: never
+    smtp_from: "croansible@fnb.co.za"
+
+    # If a container has no healthcheck configured, do NOT fail the play
+    fail_if_no_healthcheck: false
+
+  tasks:
+    # 1) Get running containers (rootful via inline sudo to match your sudoers)
+    - name: Get container list (rootful via inline sudo)
+      command: sudo podman ps --format json
+      register: containers_raw
+      changed_when: false
+
+    - name: Parse container list
+      set_fact:
+        containers_list: "{{ (containers_raw.stdout | default('[]')) | from_json }}"
+
+    - name: Early info if no containers found
+      when: containers_list | length == 0
+      debug:
+        msg: "No running containers found (report will still be generated)."
+
+    # 2) Inspect each container (only when we have any)
+    - name: Inspect each container
+      command: sudo podman inspect {{ item.Id }} --format json
+      register: inspect_results
+      loop: "{{ containers_list }}"
+      loop_control:
+        label: "{{ item.Names[0] | default(item.Id[:12]) }}"
+      changed_when: false
+      when: containers_list | length > 0
+
+    # Build a dict: { "<containerId>": <inspect_json_object> }
+    - name: Init inspect_map
+      set_fact:
+        inspect_map: {}
+
+    - name: Populate inspect_map
+      set_fact:
+        inspect_map: "{{ inspect_map | combine({ one.Id: one }) }}"
+      vars:
+        one: "{{ (item.stdout | from_json)[0] }}"
+      loop: "{{ inspect_results.results | default([]) }}"
+      when:
+        - item is defined
+        - item.stdout is defined
+        - item.stdout | length > 0
+
+    # 3) Enrich containers with their inspect (loop-based, safe)
+    - name: Init enriched list
+      set_fact:
+        containers_enriched: []
+
+    - name: Enrich container list with inspect
+      set_fact:
+        containers_enriched: "{{ containers_enriched + [ (item | combine({'_inspect': (inspect_map.get(item.Id, {}))})) ] }}"
+      loop: "{{ containers_list }}"
+      loop_control:
+        label: "{{ item.Names[0] | default(item.Id[:12]) }}"
+      when: containers_list | length > 0
+
+    # 4) Health validation (optional; we never fail on missing healthchecks unless configured)
+    - name: Fail if any container is unhealthy (only those with healthchecks)
+      fail:
+        msg: >-
+          Container {{ item.Names[0] | default(item.Id[:12]) }} is NOT healthy
+          (state={{ item._inspect.State.Health.Status }})
+      when:
+        - item._inspect is defined
+        - item._inspect.State is defined
+        - item._inspect.State.Health is defined
+        - item._inspect.State.Health.Status is defined
+        - item._inspect.State.Health.Status != "healthy"
+      loop: "{{ containers_enriched | default([]) }}"
+      loop_control:
+        label: "{{ item.Names[0] | default(item.Id[:12]) }}"
+
+    - name: Optionally fail if container has no healthcheck
+      fail:
+        msg: >-
+          Container {{ item.Names[0] | default(item.Id[:12]) }} has NO healthcheck configured
+      when:
+        - fail_if_no_healthcheck | bool
+        - item._inspect is defined
+        - (item._inspect.State.Health is not defined) or (item._inspect.State.Health.Status is not defined)
+      loop: "{{ containers_enriched | default([]) }}"
+      loop_control:
+        label: "{{ item.Names[0] | default(item.Id[:12]) }}"
+
+    # 5) Render HTML report
+    - name: Render HTML report
+      ansible.builtin.template:
+        src: container_health_report.html.j2
+        dest: "{{ report_path }}"
+        mode: "0644"
+      vars:
+        report_host: "{{ ansible_hostname }}"
+        report_time: "{{ ansible_date_time.date }} {{ ansible_date_time.time }}"
+        rows: "{{ containers_enriched | default([]) }}"
+
+    - name: Show where the report is saved
+      debug:
+        msg: "Report saved: {{ report_path }}"
+
+    # 6) Email the HTML report
+    # Option A: local MTA
+    - name: Email report via local MTA
+      ansible.builtin.mail:
+        to: "{{ notify_to | join(',') }}"
+        cc: "{{ (notify_cc | length > 0) | ternary(notify_cc | join(','), omit) }}"
+        subject: "{{ notify_subject }}"
+        body: "{{ lookup('file', report_path) }}"
+        subtype: html
+        from: "{{ smtp_from }}"
+      when:
+        - notify_enabled
+        - use_local_mta
+
+    # Option B: SMTP (requires community.general)
+    - name: Email report via SMTP
+      community.general.mail:
+        to: "{{ notify_to | join(',') }}"
+        cc: "{{ (notify_cc | length > 0) | ternary(notify_cc | join(','), omit) }}"
+        subject: "{{ notify_subject }}"
+        body: "{{ lookup('file', report_path) }}"
+        subtype: html
+        from: "{{ smtp_from }}"
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        secure: never
+      when:
+        - notify_enabled
+        - not use_local_mta
+
