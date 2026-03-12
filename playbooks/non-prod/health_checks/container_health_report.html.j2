@@ -6,22 +6,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {
-      --bg: #0f172a;           /* slate-900 */
-      --panel: #111827;        /* gray-900 */
-      --text: #e5e7eb;         /* gray-200 */
-      --muted: #9ca3af;        /* gray-400 */
-      --border: #1f2937;       /* gray-800 */
-      --ok: #10b981;           /* emerald-500 */
-      --warn: #f59e0b;         /* amber-500 */
-      --bad: #ef4444;          /* red-500 */
-      --info: #3b82f6;         /* blue-500 */
-      --chip: #374151;         /* gray-700 */
-      --table-row: #0b1324;    /* custom */
+      --bg: #0f172a; --panel: #111827; --text: #e5e7eb; --muted: #9ca3af;
+      --border: #1f2937; --ok: #10b981; --warn: #f59e0b; --bad: #ef4444;
+      --info: #3b82f6; --chip: #374151; --table-row: #0b1324;
     }
-    body { background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; margin: 0; padding: 24px; }
+    body { background: var(--bg); color: var(--text); font: 14px/1.5 system-ui; margin: 0; padding: 24px; }
     .container { max-width: 1100px; margin: 0 auto; }
     h1 { font-size: 22px; margin: 0 0 6px; }
-    .sub { color: var(--muted); margin-bottom: 18px; }
     .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 18px; }
     .summary { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }
     .card { background: #0b1220; border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
@@ -33,73 +24,98 @@
     .chip.warn { background: rgba(245,158,11,.15); color: var(--warn); border: 1px solid rgba(245,158,11,.3); }
     .chip.info { background: rgba(59,130,246,.15); color: var(--info); border: 1px solid rgba(59,130,246,.3); }
     table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 10px 12px; vertical-align: top; }
-    thead th { font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: .04em; }
-    tbody tr { border-bottom: 1px solid var(--border); background: var(--table-row); }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    tbody tr { background: var(--table-row); }
     tbody tr:nth-child(even) { background: #0a1020; }
-    .name { font-weight: 600; }
     .muted { color: var(--muted); }
     .small { font-size: 12px; color: var(--muted); }
-    .ports { display: inline-flex; gap: 6px; flex-wrap: wrap; }
-    .footer { color: var(--muted); margin-top: 8px; font-size: 12px; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>{{ report_title }} — {{ report_host }}</h1>
+    <h1>{{ report_title }} &mdash; {{ report_host }}</h1>
     <div class="sub">Generated: {{ report_time }}</div>
 
-    {% set total = rows | length %}
-    {% set running = rows | selectattr('State','equalto','running') | list | length %}
-    {% set healthy = rows
+    {% set total = rows_ctx | length %}
+    {% set running = rows_ctx | selectattr('State','equalto','running') | list | length %}
+    {% set healthy = rows_ctx
         | selectattr('_inspect.State.Health.Status','defined')
         | selectattr('_inspect.State.Health.Status','equalto','healthy')
         | list | length %}
-    {% set with_health = rows
+    {% set with_health = rows_ctx
         | selectattr('_inspect.State.Health','defined')
         | list | length %}
 
     <div class="summary">
-      <div class="card">
-        <h3>Total Containers</h3>
-        <div class="value">{{ total }}</div>
-      </div>
-      <div class="card">
-        <h3>Running</h3>
-        <div class="value" style="color: var(--ok)">{{ running }}</div>
-      </div>
+      <div class="card"><h3>Total Containers</h3><div class="value">{{ total }}</div></div>
+      <div class="card"><h3>Running</h3><div class="value" style="color:var(--ok)">{{ running }}</div></div>
       <div class="card">
         <h3>Healthy</h3>
-        <div class="value" style="color: var(--ok)">{{ healthy }}</div>
+        <div class="value" style="color:var(--ok)">{{ healthy }}</div>
         <div class="small">{{ with_health }}/{{ total }} have healthchecks</div>
       </div>
+      <div class="card"><h3>Host</h3><div class="value">{{ report_host }}</div><div class="small">{{ report_time }}</div></div>
+
       <div class="card">
-        <h3>Host</h3>
-        <div class="value">{{ report_host }}</div>
-        <div class="small">{{ report_time }}</div>
+        <h3>Disk (worst)</h3>
+        <div class="value" style="color:{% if host_health_ctx.disk.status=='bad' %}var(--bad){% elif host_health_ctx.disk.status=='warn' %}var(--warn){% else %}var(--ok){% endif %}">
+          {{ host_health_ctx.disk.worst_used_pct }}%
+        </div>
+      </div>
+      <div class="card">
+        <h3>Memory</h3>
+        <div class="value" style="color:{% if host_health_ctx.memory.status=='bad' %}var(--bad){% elif host_health_ctx.memory.status=='warn' %}var(--warn){% else %}var(--ok){% endif %}">
+          {{ host_health_ctx.memory.used_pct }}%
+        </div>
+        <div class="small">{{ host_health_ctx.memory.used_mb }} / {{ host_health_ctx.memory.total_mb }} MB</div>
+      </div>
+      <div class="card">
+        <h3>CPU</h3>
+        <div class="value" style="color:{% if host_health_ctx.cpu.status=='bad' %}var(--bad){% elif host_health_ctx.cpu.status=='warn' %}var(--warn){% else %}var(--ok){% endif %}">
+          {{ host_health_ctx.cpu.load_pct }}%
+        </div>
+        <div class="small">1m: {{ host_health_ctx.cpu.load1 }} over {{ host_health_ctx.cpu.vcpus }} vCPU(s)</div>
       </div>
     </div>
 
     <div class="panel">
+      <h2>Host Resources</h2>
+      <table>
+        <thead><tr><th>Mount</th><th>Fstype</th><th>Total (GB)</th><th>Free (GB)</th><th>Used %</th></tr></thead>
+        <tbody>
+          {% if host_health_ctx.disk['items'] | length == 0 %}
+            <tr><td colspan="5"><span class="muted">No eligible filesystems found.</span></td></tr>
+          {% else %}
+            {% for d in host_health_ctx.disk['items'] %}
+              <tr>
+                <td>{{ d.mount }}</td>
+                <td class="muted">{{ d.fstype }}</td>
+                <td>{{ d.total_gb }}</td>
+                <td>{{ d.avail_gb }}</td>
+                <td><span class="chip {{ d.status }}">{{ d.used_pct }}%</span></td>
+              </tr>
+            {% endfor %}
+          {% endif %}
+        </tbody>
+      </table>
+      <div class="small muted">
+        Disk status is <strong>{{ host_health_ctx.disk.status }}</strong>. Warn &ge; {{ disk_warn_ctx }}%, Crit &ge; {{ disk_crit_ctx }}%.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Containers</h2>
       <table>
         <thead>
-          <tr>
-            <th>Container</th>
-            <th>Status</th>
-            <th>Health</th>
-            <th>Image</th>
-            <th>Ports</th>
-            <th>Pod</th>
-            <th>Uptime</th>
-          </tr>
+          <tr><th>Container</th><th>Status</th><th>Health</th><th>Image</th><th>Ports</th><th>Pod</th><th>Uptime</th></tr>
         </thead>
         <tbody>
-          {% for c in rows %}
+          {% for c in rows_ctx %}
             {% set name = c.Names[0] if c.Names is defined and c.Names|length > 0 else c.Id[:12] %}
             {% set state = c.State | default('') %}
             {% set status = c.Status | default('') %}
             {% set image = c.Image | default('') %}
-            {% set podname = c.PodName | default('—') %}
+            {% set podname = c.PodName | default('&mdash;') %}
             {% set inspect = c._inspect | default({}) %}
             {% set health = inspect.State.Health.Status if inspect.State is defined and inspect.State.Health is defined and inspect.State.Health.Status is defined else 'no healthcheck' %}
             {% set health_class = 'ok' if health == 'healthy' else ('bad' if health == 'unhealthy' else 'warn') %}
@@ -108,16 +124,14 @@
             {% for k, v in ports_map.items() %}
               {% if v is not none and v|length > 0 %}
                 {% for m in v %}
-                  {% set _ = port_entries.append(k ~ ' → ' ~ (m.HostIp | default('0.0.0.0')) ~ ':' ~ m.HostPort) %}
+                  {% set _ = port_entries.append(k ~ ' &rarr; ' ~ (m.HostIp | default('0.0.0.0')) ~ ':' ~ m.HostPort) %}
                 {% endfor %}
               {% else %}
                 {% set _ = port_entries.append(k) %}
               {% endif %}
             {% endfor %}
             <tr>
-              <td class="name">
-                {{ name }}<div class="small muted">{{ c.Id[:12] }}</div>
-              </td>
+              <td>{{ name }}<div class="small muted">{{ c.Id[:12] }}</div></td>
               <td>
                 {% if state == 'running' %}
                   <span class="chip ok">running</span>
@@ -126,9 +140,7 @@
                 {% endif %}
                 <div class="small muted">{{ status }}</div>
               </td>
-              <td>
-                <span class="chip {{ health_class }}">{{ health }}</span>
-              </td>
+              <td><span class="chip {{ health_class }}">{{ health }}</span></td>
               <td>
                 {{ image }}
                 {% if inspect.Config and inspect.Config.Labels and inspect.Config.Labels['org.opencontainers.image.version'] is defined %}
@@ -137,16 +149,14 @@
               </td>
               <td>
                 {% if port_entries | length > 0 %}
-                  <div class="ports">
-                    {% for p in port_entries %}
-                      <span class="chip info">{{ p }}</span>
-                    {% endfor %}
-                  </div>
+                  {% for p in port_entries %}
+                    <span class="chip info">{{ p }}</span>
+                  {% endfor %}
                 {% else %}
-                  <span class="muted">—</span>
+                  <span class="muted">&mdash;</span>
                 {% endif %}
               </td>
-              <td>{{ podname if podname|length > 0 else '—' }}</td>
+              <td>{{ podname if podname|length > 0 else '&mdash;' }}</td>
               <td>
                 <div>{{ c.CreatedAt | default('') }}</div>
                 {% if inspect.State and inspect.State.StartedAt is defined %}
@@ -157,11 +167,8 @@
           {% endfor %}
         </tbody>
       </table>
-      <div class="footer">
-        Generated by Ansible on {{ report_host }} · {{ report_time }}
-      </div>
+      <div class="small muted">Generated by Ansible on {{ report_host }} &middot; {{ report_time }}</div>
     </div>
   </div>
 </body>
 </html>
-
