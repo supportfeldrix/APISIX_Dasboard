@@ -69,6 +69,7 @@ class BackgroundScheduler:
         self._prober: HealthCheckProber = HealthCheckProber()
         self._previous_metrics: dict[str, dict[str, float]] = {}
         self._previous_pod_starts: dict[str, str] = {}
+        self._warmup_cycles: int = 0  # Skip first 2 cycles after startup
 
     async def start(self) -> None:
         """Start the background scheduler.
@@ -370,6 +371,15 @@ class BackgroundScheduler:
                 except Exception as exc:
                     logger.error("Error purging old notification logs: %s", exc)
 
+                # Increment warmup counter (first 2 cycles store metrics only)
+                if self._warmup_cycles < 2:
+                    self._warmup_cycles += 1
+                    logger.info(
+                        "Warmup cycle %d/2 complete. "
+                        "Storing metrics for stable delta comparison.",
+                        self._warmup_cycles,
+                    )
+
             finally:
                 db.close()
 
@@ -445,8 +455,67 @@ class BackgroundScheduler:
             rule.name, condition, route_id, route_id in route_metrics,
         )
 
+        # ─── Warmup guard ───────────────────────────────────────────────────
+        # After pod startup, wait 2 full cycles before alerting. This prevents
+        # false alerts from load-balancer jitter: the first cycles might scrape
+        # different pods (with different counters), causing false cycle_deltas.
+        # During warmup we store metrics to establish stable __prev__ values.
+        if self._warmup_cycles < 2:
+            metrics = route_metrics.get(route_id)
+            if metrics is not None:
+                self._previous_metrics[route_id] = dict(metrics)
+
+                if condition == ConditionType.UPSTREAM_ERROR.value:
+                    current_5xx = 0.0
+                    for code, count in metrics.items():
+                        try:
+                            code_int = int(code)
+                        except (ValueError, TypeError):
+                            continue
+                        if 500 <= code_int <= 599:
+                            current_5xx += count
+                    upstream_key = f"__upstream_error__{route_id}"
+                    prev_data = self._previous_metrics.get(upstream_key, {})
+                    hwm_5xx = prev_data.get("__hwm_5xx__", 0.0)
+                    self._previous_metrics[upstream_key] = {
+                        "__hwm_5xx__": max(hwm_5xx, current_5xx),
+                        "__prev_5xx__": current_5xx,
+                        **{k: v for k, v in metrics.items()},
+                    }
+
+                elif condition == ConditionType.CLIENT_ERROR.value:
+                    current_4xx = 0.0
+                    for code, count in metrics.items():
+                        try:
+                            code_int = int(code)
+                        except (ValueError, TypeError):
+                            continue
+                        if 400 <= code_int <= 499:
+                            current_4xx += count
+                    client_error_key = f"__client_error__{route_id}"
+                    prev_data = self._previous_metrics.get(client_error_key, {})
+                    hwm_4xx = prev_data.get("__hwm_4xx__", 0.0)
+                    self._previous_metrics[client_error_key] = {
+                        "__hwm_4xx__": max(hwm_4xx, current_4xx),
+                        "__prev_4xx__": current_4xx,
+                        **{k: v for k, v in metrics.items()},
+                    }
+            return
+        # ─────────────────────────────────────────────────────────────────────
+
         if condition == ConditionType.UPSTREAM_ERROR.value:
-            # Delta-based evaluation: only alert on NEW 5xx errors
+            # Dual detection: cycle-over-cycle delta + high-water mark.
+            #
+            # The simple delta alone can produce false positives when load-balancer
+            # jitter causes the scraped value to bounce between APISIX pods (each
+            # pod has independent Prometheus counters). The HWM provides an upper
+            # bound, while cycle delta catches real errors below the HWM.
+            #
+            # Alert fires if EITHER condition is true:
+            #   1. current_5xx > HWM (definitely new errors — exceeded all-time max)
+            #   2. cycle_delta >= threshold (new errors since last scrape cycle)
+            #
+            # Negative cycle_delta (jitter bouncing down) is ignored.
             metrics = route_metrics.get(route_id)
             if metrics is not None:
                 # Calculate current 5xx total
@@ -461,35 +530,49 @@ class BackgroundScheduler:
                         current_5xx += count
                         fivexx_breakdown[code] = count
 
-                # Get previous 5xx total for this route
-                prev_metrics = self._previous_metrics.get(route_id, {})
-                previous_5xx = 0.0
-                for code, count in prev_metrics.items():
-                    try:
-                        code_int = int(code)
-                    except (ValueError, TypeError):
-                        continue
-                    if 500 <= code_int <= 599:
-                        previous_5xx += count
+                # Get high-water mark and previous cycle count
+                upstream_key = f"__upstream_error__{route_id}"
+                prev_data = self._previous_metrics.get(upstream_key, {})
+                hwm_5xx = prev_data.get("__hwm_5xx__", 0.0)
+                prev_5xx = prev_data.get("__prev_5xx__", hwm_5xx)
 
-                # Calculate delta (new errors since last check)
-                delta_5xx = current_5xx - previous_5xx
+                # Two delta calculations:
+                # 1. HWM delta — only positive when exceeding all-time max
+                delta_hwm = current_5xx - hwm_5xx
+                # 2. Cycle delta — change since last evaluation cycle
+                cycle_delta = current_5xx - prev_5xx
 
-                # Store current metrics for next cycle comparison
+                # Update the high-water mark (never decreases) and store
+                # current count for next cycle's delta comparison
+                new_hwm = max(hwm_5xx, current_5xx)
+                self._previous_metrics[upstream_key] = {
+                    "__hwm_5xx__": new_hwm,
+                    "__prev_5xx__": current_5xx,
+                    **{k: v for k, v in metrics.items()},
+                }
+
+                # Read previous 2xx BEFORE overwriting with current metrics
+                prev_route_metrics = self._previous_metrics.get(route_id, {})
+
+                # Store current metrics under the route_id key for next cycle
                 self._previous_metrics[route_id] = dict(metrics)
 
-                # First cycle after pod restart: _previous_metrics was empty so
-                # prev_metrics is {}. Treat this as a baseline — store metrics but
-                # do NOT alert. This prevents false alerts from cumulative counters.
-                if not prev_metrics:
+                # First cycle after pod restart: prev_data is empty (no hwm stored).
+                # Treat this as a baseline — store metrics but do NOT alert.
+                if not prev_data:
                     logger.debug(
                         "UPSTREAM_ERROR baseline established for route '%s' "
-                        "(current_5xx=%.0f). No alert on first cycle.",
-                        route_id, current_5xx,
+                        "(current_5xx=%.0f, hwm=%.0f). No alert on first cycle.",
+                        route_id, current_5xx, new_hwm,
                     )
                     return
 
-                if delta_5xx >= threshold:
+                # Alert fires if either detection path triggers:
+                # - HWM exceeded (covers the case when both pods increment)
+                # - Cycle delta >= threshold (covers single-pod new errors)
+                effective_delta = max(delta_hwm, cycle_delta)
+
+                if effective_delta >= threshold:
                     # New 5xx errors detected — trigger alert
                     now = datetime.now(timezone.utc)
                     context = AlertContext(
@@ -501,7 +584,7 @@ class BackgroundScheduler:
                         metric_values={
                             "5xx_breakdown": fivexx_breakdown,
                             "total_upstream_errors": current_5xx,
-                            "new_errors": delta_5xx,
+                            "new_errors": effective_delta,
                         },
                         threshold=threshold,
                         evaluation_window_start=now - timedelta(minutes=5),
@@ -510,26 +593,24 @@ class BackgroundScheduler:
                     await trigger_alert(rule, context, db)
                     await escalation_service.handle_alert_triggered(rule, context, db)
                 else:
-                    # No new 5xx — check if traffic is flowing (new 2xx = service recovered)
+                    # No new 5xx detected — check recovery
+                    # Use absolute 2xx presence (not delta) because load-balancer
+                    # jitter between pods can make delta_2xx negative even when
+                    # traffic is flowing fine.
                     current_2xx = sum(
                         count for code, count in metrics.items()
                         if code.startswith("2")
                     )
-                    previous_2xx = sum(
-                        count for code, count in prev_metrics.items()
-                        if code.startswith("2")
-                    )
-                    delta_2xx = current_2xx - previous_2xx
 
-                    if delta_2xx > 0:
-                        # Traffic flowing successfully, no new errors — send recovery
+                    if current_2xx > 0 and cycle_delta <= 0:
+                        # Traffic flowing, no new errors — send recovery
                         recovery_context = AlertContext(
                             rule_id=rule.id,
                             rule_name=rule.name,
                             route_id=route_id,
                             route_name=rule.route_name or route_id,
                             condition_type=ConditionType.UPSTREAM_ERROR.value,
-                            metric_values={"new_2xx": delta_2xx, "new_5xx": 0},
+                            metric_values={"current_2xx": current_2xx, "new_5xx": 0},
                             threshold=threshold,
                             is_recovery=True,
                         )
@@ -538,11 +619,9 @@ class BackgroundScheduler:
             return
 
         if condition == ConditionType.CLIENT_ERROR.value:
-            # Delta-based evaluation: only alert on NEW 4xx errors.
-            # Uses a HIGH-WATER MARK to avoid false positives from the metrics
-            # service load-balancing across multiple APISIX pods (each pod has
-            # its own independent counters — alternating between pods causes
-            # the observed count to jump up/down, creating false deltas).
+            # Dual detection: cycle-over-cycle delta + high-water mark.
+            # Same approach as UPSTREAM_ERROR — catches real errors even when
+            # load-balancer jitter causes the scraped value to stay below HWM.
             metrics = route_metrics.get(route_id)
             if metrics is not None:
                 # Calculate current 4xx total
@@ -557,22 +636,32 @@ class BackgroundScheduler:
                         current_4xx += count
                         fourxx_breakdown[code] = count
 
-                # Get the high-water mark (maximum 4xx count ever seen).
-                # Only fire when current exceeds the previous maximum —
-                # this means genuinely NEW errors occurred.
+                # Get high-water mark and previous cycle count
                 client_error_key = f"__client_error__{route_id}"
                 prev_data = self._previous_metrics.get(client_error_key, {})
                 hwm_4xx = prev_data.get("__hwm_4xx__", 0.0)
+                prev_4xx = prev_data.get("__prev_4xx__", hwm_4xx)
 
-                # Delta is only positive when we exceed the historical max
-                delta_4xx = current_4xx - hwm_4xx
+                # Two delta calculations:
+                # 1. HWM delta — only positive when exceeding all-time max
+                delta_hwm = current_4xx - hwm_4xx
+                # 2. Cycle delta — change since last evaluation cycle
+                cycle_delta = current_4xx - prev_4xx
 
-                # Update the high-water mark (never decreases)
+                # Update the high-water mark (never decreases) and store
+                # current count for next cycle's delta comparison
                 new_hwm = max(hwm_4xx, current_4xx)
                 self._previous_metrics[client_error_key] = {
                     "__hwm_4xx__": new_hwm,
+                    "__prev_4xx__": current_4xx,
                     **{k: v for k, v in metrics.items()},
                 }
+
+                # Read previous 2xx BEFORE overwriting with current metrics
+                prev_route_metrics = self._previous_metrics.get(route_id, {})
+
+                # Store current metrics under route_id for next cycle
+                self._previous_metrics[route_id] = dict(metrics)
 
                 # First cycle after pod restart: prev_data is empty (no hwm stored).
                 # Treat this as a baseline — store the hwm but do NOT alert.
@@ -587,11 +676,15 @@ class BackgroundScheduler:
                 # Log for debugging
                 if current_4xx > 0:
                     logger.info(
-                        "[CLIENT_ERROR] route=%s current_4xx=%.0f hwm=%.0f delta=%.0f threshold=%d",
-                        route_id, current_4xx, hwm_4xx, delta_4xx, threshold,
+                        "[CLIENT_ERROR] route=%s current_4xx=%.0f hwm=%.0f "
+                        "delta_hwm=%.0f cycle_delta=%.0f threshold=%d",
+                        route_id, current_4xx, hwm_4xx, delta_hwm, cycle_delta, threshold,
                     )
 
-                if delta_4xx >= threshold:
+                # Alert fires if either detection path triggers
+                effective_delta = max(delta_hwm, cycle_delta)
+
+                if effective_delta >= threshold:
                     # New 4xx errors detected — trigger alert
                     now = datetime.now(timezone.utc)
                     context = AlertContext(
@@ -603,7 +696,7 @@ class BackgroundScheduler:
                         metric_values={
                             "4xx_breakdown": fourxx_breakdown,
                             "total_client_errors": current_4xx,
-                            "new_errors": delta_4xx,
+                            "new_errors": effective_delta,
                         },
                         threshold=threshold,
                         evaluation_window_start=now - timedelta(minutes=5),
@@ -612,14 +705,17 @@ class BackgroundScheduler:
                     await trigger_alert(rule, context, db)
                     await escalation_service.handle_alert_triggered(rule, context, db)
                 else:
-                    # No new 4xx above high-water mark — send recovery if 2xx traffic is flowing
+                    # No new 4xx detected — check recovery
+                    # Use absolute 2xx presence (not delta) because load-balancer
+                    # jitter between pods can make delta_2xx negative even when
+                    # traffic is flowing fine.
                     current_2xx = sum(
                         count for code, count in metrics.items()
                         if code.startswith("2")
                     )
 
-                    if current_2xx > 0:
-                        # Traffic flowing successfully, no new errors — send recovery
+                    if current_2xx > 0 and cycle_delta <= 0:
+                        # Traffic flowing, no new errors — send recovery
                         recovery_context = AlertContext(
                             rule_id=rule.id,
                             rule_name=rule.name,

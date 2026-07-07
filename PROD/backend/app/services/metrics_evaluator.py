@@ -23,6 +23,11 @@ MIN_RESPONSES_FOR_RATE = 10
 def fetch_route_metrics() -> Dict[str, Dict[str, float]]:
     """Fetch and parse per-route HTTP status code metrics from Prometheus.
 
+    Scrapes the metrics endpoint TWICE to account for load-balancer jitter
+    between APISIX pods (each pod has independent cumulative counters).
+    Takes the MAX value per route/code across both scrapes, providing a
+    stable ceiling that doesn't bounce between pod counter values.
+
     Returns a dict keyed by route_id, where each value is a dict mapping
     HTTP status code strings (e.g. "401", "502") to their request counts.
 
@@ -34,18 +39,40 @@ def fetch_route_metrics() -> Dict[str, Dict[str, float]]:
     """
     try:
         with httpx.Client(timeout=settings.APISIX_METRICS_TIMEOUT) as client:
-            response = client.get(settings.APISIX_METRICS_URL)
+            response1 = client.get(settings.APISIX_METRICS_URL)
+            response2 = client.get(settings.APISIX_METRICS_URL)
     except (httpx.ConnectError, httpx.TimeoutException) as e:
         logger.error("Metrics endpoint unreachable: %s", e)
         raise MetricsUnavailableError(f"Metrics endpoint unreachable: {e}") from e
 
-    if response.status_code >= 300:
-        logger.warning("Metrics endpoint returned status %d", response.status_code)
+    if response1.status_code >= 300:
+        logger.warning("Metrics endpoint returned status %d", response1.status_code)
         raise MetricsUnavailableError(
-            f"Metrics endpoint returned {response.status_code}"
+            f"Metrics endpoint returned {response1.status_code}"
+        )
+    if response2.status_code >= 300:
+        logger.warning("Metrics endpoint (2nd) returned status %d", response2.status_code)
+        raise MetricsUnavailableError(
+            f"Metrics endpoint returned {response2.status_code}"
         )
 
-    return parse_route_status_metrics(response.text)
+    metrics1 = parse_route_status_metrics(response1.text)
+    metrics2 = parse_route_status_metrics(response2.text)
+
+    # Merge: take MAX per route/code across both scrapes.
+    # This provides a stable ceiling regardless of which pod each request hit.
+    merged: Dict[str, Dict[str, float]] = {}
+    all_routes = set(metrics1.keys()) | set(metrics2.keys())
+    for route in all_routes:
+        codes1 = metrics1.get(route, {})
+        codes2 = metrics2.get(route, {})
+        all_codes = set(codes1.keys()) | set(codes2.keys())
+        merged[route] = {
+            code: max(codes1.get(code, 0), codes2.get(code, 0))
+            for code in all_codes
+        }
+
+    return merged
 
 
 def parse_route_status_metrics(text: str) -> Dict[str, Dict[str, float]]:

@@ -125,25 +125,33 @@ async def check_recovery(rule: AlertRule, context: AlertContext, db: Session) ->
     Checks if there was a previous alert for this rule that hasn't been
     followed by a recovery notification. If so, sends a recovery email.
 
+    Only considers alerts from the last 24 hours to prevent stale old
+    alerts from triggering confusing recovery emails after pod restarts.
+
     Args:
         rule: The alert rule to check recovery for.
         context: Alert context with current metric values (is_recovery=True).
         db: Database session.
     """
-    # Check if there was a previous alert (SENT status) without a subsequent recovery
+    # Only consider alerts from the last 24 hours — stale alerts should not
+    # trigger recovery emails days/weeks later after a pod restart.
+    recovery_window = datetime.now(timezone.utc) - timedelta(hours=24)
+
+    # Check if there was a recent alert (SENT status) without a subsequent recovery
     last_alert = (
         db.query(NotificationLog)
         .filter(
             NotificationLog.alert_rule_id == rule.id,
             NotificationLog.delivery_status == DeliveryStatus.SENT.value,
             ~NotificationLog.subject.like("%RECOVERED%"),
+            NotificationLog.timestamp >= recovery_window,
         )
         .order_by(desc(NotificationLog.timestamp))
         .first()
     )
 
     if last_alert is None:
-        # No previous alert, nothing to recover from
+        # No recent alert, nothing to recover from
         return
 
     # Check if we already sent a recovery after the last alert
