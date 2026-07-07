@@ -1,0 +1,549 @@
+- name: Run Firco Windows pipeline (single WinRM session, email on failure and success)
+  hosts: windows_uat
+  gather_facts: false
+
+  vars_files:
+    - "{{ playbook_dir }}/vault_firco.yml"
+
+  vars:
+    pipeline_debug: true
+
+    # IMPORTANT: real newline character for joins and replacements (Outlook-safe)
+    nl: "\n"
+
+    # UNC share + drive letter
+    drive_letter: "Y"
+    drive_root: "\\\\FNAS-CROIT-UAT\\FircoUtil"
+
+    # FIX: cmdkey does not work reliably in WinRM sessions
+    inject_cmdkey: false
+
+    smtp_host: "mail.fnb.co.za"
+    smtp_port: 25
+    smtp_secure: "never"
+    mail_from: "croansible@fnb.co.za"
+    mail_to:
+      - "tienie.vanrooyen@fnb.co.za"
+      - "fnbregappsupport@fnb.co.za"
+    mail_subject_prefix: "UAT Firco Pipeline"
+
+    pipeline:
+      - step_no: 1
+        name: "Sharepoint_List_Download"
+        path: 'C:\Users\F5151422\Documents\Ansible\02_Sharepoint_List_Download.ps1'
+        params:
+          AuthMethod: "explicit"
+          DriveLetter: "Y"
+          DriveRoot: "\\\\FNAS-CROIT-UAT\\FircoUtil"
+          UseMappedDrive: true
+          UnmapDriveOnExit: false
+
+      - step_no: 2
+        name: "LoadInternal_FMM_Batch"
+        path: 'C:\Users\F5151422\Documents\Ansible\03_LoadInternal_FMM_Batch.ps1'
+        params:
+          DriveLetter: "Y"
+          DriveRoot: "\\\\FNAS-CROIT-UAT\\FircoUtil"
+          UseMappedDrive: true
+          UnmapDriveOnExit: false
+
+      - step_no: 3
+        name: "ExportKZ_FMM_Batch"
+        path: 'C:\Users\F5151422\Documents\Ansible\04_ExportKZ_FMM_Batch.ps1'
+        params:
+          DriveLetter: "Y"
+          DriveRoot: "\\\\FNAS-CROIT-UAT\\FircoUtil"
+          UseMappedDrive: true
+          UnmapDriveOnExit: false
+
+      - step_no: 4
+        name: "ListsCheck_GWL+WCP"
+        path: 'C:\Users\F5151422\Documents\Ansible\05_ListsCheck_GWL+WCP.ps1'
+        params:
+          DriveLetter: "Y"
+          DriveRoot: "\\\\FNAS-CROIT-UAT\\FircoUtil"
+          UseMappedDrive: true
+          UnmapDriveOnExit: false
+          ContinueOnDatabaseAgeWarning: true
+
+      - step_no: 5
+        name: "Create_Full_List"
+        path: 'C:\Users\F5151422\Documents\Ansible\06_Create_Full_List.ps1'
+        params:
+          DriveLetter: "Y"
+          DriveRoot: "\\\\FNAS-CROIT-UAT\\FircoUtil"
+          UseMappedDrive: true
+          UnmapDriveOnExit: false
+          FailOnLogArchiveError: false
+          EnableLogging: true
+
+      - step_no: 6
+        name: "Check_Full_List"
+        path: 'C:\Users\F5151422\Documents\Ansible\07_Check_Full_List.ps1'
+        params:
+          DriveLetter: "Y"
+          DriveRoot: "\\\\FNAS-CROIT-UAT\\FircoUtil"
+          UseMappedDrive: true
+          UnmapDriveOnExit: false
+          FailOnTarError: false
+
+      - step_no: 7
+        name: "Create_SWIFT_EFT_HSBC_List"
+        path: 'C:\Users\F5151422\Documents\Ansible\08_Create_SWIFT_EFT_HSBC_List.ps1'
+        params:
+          DriveLetter: "Y"
+          DriveRoot: "\\\\FNAS-CROIT-UAT\\FircoUtil"
+          UseMappedDrive: true
+          UnmapDriveOnExit: false
+
+  tasks:
+    - name: Capture controller timestamp
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.set_fact:
+        controller_timestamp: "{{ lookup('pipe', 'date -Is') }}"
+      changed_when: false
+
+    - name: Precheck + Run pipeline + email on failure/success
+      block:
+
+        - name: Precheck - confirm vaulted creds exist (no values printed)
+          ansible.builtin.assert:
+            that:
+              - firco_util_user is defined
+              - firco_util_pass is defined
+              - firco_util_user | string | length > 0
+              - firco_util_pass | string | length > 0
+            fail_msg: "Vault variables firco_util_user/firco_util_pass are missing or empty"
+          changed_when: false
+
+        - name: Sanity check - scripts exist on the target
+          ansible.windows.win_stat:
+            path: "{{ item.path }}"
+          register: stat_results
+          loop: "{{ pipeline }}"
+          loop_control:
+            label: "Step {{ item.step_no }} - {{ item.name }}"
+          changed_when: false
+
+        - name: Fail if any script file is missing
+          ansible.builtin.fail:
+            msg: >-
+              Missing script(s):
+              {{
+                stat_results.results
+                | selectattr('stat.exists', 'equalto', false)
+                | map(attribute='invocation.module_args.path')
+                | join(', ')
+              }}
+          when: >
+            (stat_results.results
+             | selectattr('stat.exists', 'equalto', false)
+             | list | length) > 0
+
+        - name: Run all steps sequentially in one WinRM session (net use map once + remap guard + summary for email)
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = "Stop"
+
+              $drive = "{{ drive_letter }}"
+              $share = "{{ drive_root }}"
+              $debug = {{ (pipeline_debug | bool) | ternary('$true', '$false') }}
+
+              $Succeeded = New-Object System.Collections.Generic.List[string]
+
+              function ConvertTo-Hashtable {
+                param($obj)
+                if ($null -eq $obj) { return $null }
+                $ht = @{}
+                foreach ($p in $obj.PSObject.Properties) { $ht[$p.Name] = $p.Value }
+                return $ht
+              }
+
+              function Run-NetExe {
+                param(
+                  [Parameter(Mandatory)]
+                  [string[]]$NetArgs,
+                  [switch]$IgnoreErrors
+                )
+
+                # Guard for null elements (helps debugging)
+                if ($null -eq $NetArgs -or $NetArgs.Count -eq 0 -or ($NetArgs | Where-Object { $_ -eq $null }).Count -gt 0) {
+                  Write-Host ("NETARGS_DEBUG::Count={0} Values={1}" -f `
+                    ($NetArgs.Count), `
+                    (($NetArgs | ForEach-Object { if ($_ -eq $null) {'<NULL>'} else { "'$_'" } }) -join ', ')
+                  )
+                  throw "Invalid net.exe args (null/empty detected)"
+                }
+
+                $net = Join-Path $env:SystemRoot "System32\net.exe"
+                $p = Start-Process -FilePath $net -ArgumentList $NetArgs -NoNewWindow -Wait -PassThru
+
+                if (-not $IgnoreErrors -and $p.ExitCode -ne 0) {
+                  throw "net.exe $($NetArgs -join ' ') failed (rc=$($p.ExitCode))"
+                }
+                return $p.ExitCode
+              }
+
+              function Map-Drive {
+                param([string]$DriveLetter,[string]$Share,[string]$User,[string]$Pass)
+
+                # delete mapping if exists (ignore failures)
+                Run-NetExe -NetArgs @("use", "$DriveLetter`:", "/delete", "/y") -IgnoreErrors | Out-Null
+
+                # map with explicit creds (WinRM safe)
+                Run-NetExe -NetArgs @("use", "$DriveLetter`:", $Share, "/user:$User", $Pass, "/persistent:no") | Out-Null
+
+                if (-not (Test-Path "$DriveLetter`:\")) {
+                  throw "Mapped drive not accessible after net use: $DriveLetter`:\"
+                }
+              }
+
+              function Write-Summary {
+                $line = ($Succeeded -join "|")
+                Write-Host ("PIPELINESUCCEEDED::{0}" -f $line)
+              }
+
+              $user = $env:FIRCO_USER
+              $pass = $env:FIRCO_PASS
+              if ([string]::IsNullOrWhiteSpace($user) -or [string]::IsNullOrWhiteSpace($pass)) {
+                $failLine = "STEPFAILED::0::Mapping::N/A::Missing FIRCO_USER/FIRCO_PASS env vars"
+                Write-Host $failLine
+                Write-Summary
+                throw $failLine
+              }
+
+              Write-Host ("WHOAMI: {0}" -f (whoami))
+              Write-Host ("Using share: {0}" -f $share)
+
+              $pipelineJson = @'
+              {{ pipeline | to_json }}
+              '@
+              $steps = $pipelineJson | ConvertFrom-Json
+
+              try {
+                # Map once at start
+                try {
+                  Map-Drive -DriveLetter $drive -Share $share -User $user -Pass $pass
+                  Write-Host ("Drive {0}: mapped to {1}" -f $drive, $share)
+                } catch {
+                  $failLine = "STEPFAILED::0::Mapping::N/A::$($_.Exception.Message)"
+                  Write-Host $failLine
+                  Write-Summary
+                  throw $failLine
+                }
+
+                foreach ($s in $steps) {
+                  $stepNo   = $s.step_no
+                  $stepName = $s.name
+                  $script   = $s.path
+
+                  # Ensure drive still mapped before each step
+                  if (-not (Test-Path "$drive`:\")) {
+                    Write-Host ("Drive {0}: not accessible before step {1}, remapping..." -f $drive, $stepNo)
+                    Map-Drive -DriveLetter $drive -Share $share -User $user -Pass $pass
+                    Write-Host ("Drive {0}: remapped to {1}" -f $drive, $share)
+                  }
+
+                  Write-Host ""
+                  Write-Host ("STEPSTART::{0}::{1}" -f $stepNo, $stepName)
+                  Write-Host ("==== Step {0}: {1} ====" -f $stepNo, $stepName)
+                  Write-Host ("Script: {0}" -f $script)
+
+                  if (-not (Test-Path -LiteralPath $script)) {
+                    $failLine = "STEPFAILED::${stepNo}::${stepName}::${script}::Script not found"
+                    Write-Host $failLine
+                    Write-Summary
+                    throw $failLine
+                  }
+
+                  $params = ConvertTo-Hashtable $s.params
+
+                  try {
+                    Push-Location -Path $env:SystemRoot
+
+                    if ($null -ne $params -and $params.Count -gt 0) {
+                      if ($debug) {
+                        $paramText = ($params.Keys | Sort-Object | ForEach-Object { "-$($_)=$($params[$_])" }) -join " "
+                        Write-Host ("Params: {0}" -f $paramText)
+                      }
+                      & $script @params
+                    } else {
+                      if ($debug) { Write-Host "Params: <none>" }
+                      & $script
+                    }
+
+                    Write-Host ("STEPSUCCESS::{0}::{1}" -f $stepNo, $stepName)
+                    Write-Host ("Step {0} SUCCESS - {1}" -f $stepNo, $stepName)
+                    $Succeeded.Add(("{0}::{1}" -f $stepNo, $stepName)) | Out-Null
+                  }
+                  catch {
+                    $msg = $_.Exception.Message
+                    Write-Host ("STEPFAILMARK::{0}::{1}::{2}" -f $stepNo, $stepName, $msg)
+                    $failLine = "STEPFAILED::${stepNo}::${stepName}::${script}::${msg}"
+                    Write-Host $failLine
+                    Write-Summary
+                    throw $failLine
+                  }
+                  finally {
+                    try { Pop-Location } catch {}
+                  }
+                }
+
+                Write-Summary
+              }
+              finally {
+                # cleanup mapping
+                try { Run-NetExe -NetArgs @("use", "$drive`:", "/delete", "/y") -IgnoreErrors | Out-Null } catch {}
+              }
+          environment:
+            FIRCO_USER: "{{ firco_util_user }}"
+            FIRCO_PASS: "{{ firco_util_pass }}"
+          register: pipeline_run
+          no_log: false
+          changed_when: true
+
+        # ---------------------------
+        # SUCCESS EMAIL
+        # ---------------------------
+        - name: Capture runner output for success email
+          delegate_to: localhost
+          run_once: true
+          ansible.builtin.set_fact:
+            run_out: "{{ hostvars[ansible_play_hosts[0]].pipeline_run.host_out | default('') }}"
+            target_host: "{{ ansible_play_hosts[0] }}"
+          changed_when: false
+
+        # ? KEY FIX: normalize literal \n and \r\n into real newlines
+        - name: Normalize runner output (success)
+          delegate_to: localhost
+          run_once: true
+          ansible.builtin.set_fact:
+            run_out_norm: >-
+              {{
+                run_out
+                | replace('\\r\\n', nl)
+                | replace('\\n', nl)
+              }}
+          changed_when: false
+
+        - name: Extract warnings/errors lists (success)
+          delegate_to: localhost
+          run_once: true
+          ansible.builtin.set_fact:
+            warn_lines: "{{ run_out_norm | regex_findall('(?mi)^.*(?:\\s-W-\\s|^WARNING\\b|Write-Warning|\\bWARN\\b).*$') }}"
+            err_lines:  "{{ run_out_norm | regex_findall('(?mi)^.*(?:\\s-E-\\s|\\s-A-\\s|\\bFAILED\\b|STEPFAILED::|STEPFAILMARK::).*$') }}"
+          changed_when: false
+
+        - name: Compute warnings/errors counts and tails (success)
+          delegate_to: localhost
+          run_once: true
+          ansible.builtin.set_fact:
+            warn_count: "{{ warn_lines | length }}"
+            err_count: "{{ err_lines | length }}"
+            warn_tail_text: "{{ (warn_lines[-60:] | join(nl)) if (warn_lines | length > 0) else 'None' }}"
+            err_tail_text: "{{ (err_lines[-40:] | join(nl)) if (err_lines | length > 0) else 'None' }}"
+            out_tail: >-
+              {{
+                (run_out_norm.splitlines()[-120:] | join(nl))
+                if (run_out_norm | length > 0)
+                else ''
+              }}
+          changed_when: false
+
+        # ? KEY FIX: build succeeded steps using join(nl) (real newlines)
+        - name: Build succeeded jobs list (success) - Outlook multiline
+          delegate_to: localhost
+          run_once: true
+          ansible.builtin.set_fact:
+            succeeded_steps_success_text: |-
+              {%- set sum = (run_out_norm | regex_findall('PIPELINESUCCEEDED::([^\r\n]+)') | last | default('')) -%}
+              {%- set items = (sum.split('|') if sum|length > 0 else []) -%}
+              {%- if items|length == 0 -%}
+              {%- set pairs = run_out_norm | regex_findall('STEPSUCCESS::([0-9]+)::([^\r\n]+)') -%}
+              {%- set items = pairs | map('join','::') | list -%}
+              {%- endif -%}
+              {%- set lines = [] -%}
+              {%- for it in items if it|length > 0 -%}
+              {%- set parts = it.split('::', 1) -%}
+              {%- set name = parts[1] if parts|length > 1 else it -%}
+              {%- set _ = lines.append('- ' ~ name) -%}
+              {%- endfor -%}
+              {{ (lines | join(nl)) if (lines | length > 0) else 'None' }}
+          changed_when: false
+
+        - name: Send success email
+          delegate_to: localhost
+          run_once: true
+          ansible.builtin.mail:
+            host: "{{ smtp_host }}"
+            port: "{{ smtp_port }}"
+            secure: "{{ smtp_secure }}"
+            to: "{{ mail_to }}"
+            from: "{{ mail_from }}"
+            subject: >-
+              {{ mail_subject_prefix }}
+              {{ (warn_count | int > 0) | ternary('SUCCESS (WARNINGS: ' ~ warn_count ~ ')', 'SUCCESS') }}
+              - All {{ pipeline | length }} steps completed
+            body: |
+              Firco pipeline completed successfully.
+
+              Target host: {{ target_host }}
+              Timestamp (controller): {{ controller_timestamp | default('unknown') }}
+
+              Steps that completed successfully:
+              --------------------------------
+              {{ succeeded_steps_success_text }}
+
+              Warning summary:
+              - Total warnings detected: {{ warn_count }}
+              - Total error-like lines detected: {{ err_count }}
+
+              --- Warnings (last 60) ---
+              {{ warn_tail_text }}
+
+              --- Error-like lines (last 40) ---
+              {{ err_tail_text }}
+
+              --- Runner output tail (last 120 lines) ---
+              {{ out_tail }}
+
+      rescue:
+        - name: Capture outputs for parsing
+          ansible.builtin.set_fact:
+            host_out_text: "{{ ansible_failed_result.host_out | default('') }}"
+            stderr_text: "{{ ansible_failed_result.stderr | default('') }}"
+            stdout_text: "{{ ansible_failed_result.stdout | default('') }}"
+            msg_text: "{{ ansible_failed_result.msg | default('') }}"
+          changed_when: false
+
+        - name: Build combined output (_out_all)
+          ansible.builtin.set_fact:
+            _out_all: >-
+              {{
+                (host_out_text | default(''))
+                ~ nl ~ (stdout_text | default(''))
+                ~ nl ~ (stderr_text | default(''))
+                ~ nl ~ (msg_text | default(''))
+              }}
+          changed_when: false
+
+        # ? KEY FIX: normalize failure output too
+        - name: Normalize runner output (failure)
+          ansible.builtin.set_fact:
+            _out_all_norm: >-
+              {{
+                _out_all
+                | replace('\\r\\n', nl)
+                | replace('\\n', nl)
+              }}
+          changed_when: false
+
+        - name: Build succeeded jobs list (failure) - Outlook multiline
+          ansible.builtin.set_fact:
+            succeeded_steps_text: |-
+              {%- set sum = (_out_all_norm | regex_findall('PIPELINESUCCEEDED::([^\r\n]+)') | last | default('')) -%}
+              {%- set items = (sum.split('|') if sum|length > 0 else []) -%}
+              {%- if items|length == 0 -%}
+              {%- set pairs = _out_all_norm | regex_findall('STEPSUCCESS::([0-9]+)::([^\r\n]+)') -%}
+              {%- set items = pairs | map('join','::') | list -%}
+              {%- endif -%}
+              {%- set lines = [] -%}
+              {%- for it in items if it|length > 0 -%}
+              {%- set parts = it.split('::', 1) -%}
+              {%- set name = parts[1] if parts|length > 1 else it -%}
+              {%- set _ = lines.append('- ' ~ name) -%}
+              {%- endfor -%}
+              {{ (lines | join(nl)) if (lines | length > 0) else 'None' }}
+          changed_when: false
+
+        - name: Extract failed marker line (prefer STEPFAILED else STEPFAILMARK)
+          ansible.builtin.set_fact:
+            failed_line: >-
+              {{
+                (
+                  (_out_all_norm | regex_findall('STEPFAILED::.*'))
+                  | last
+                )
+                | default(
+                    (
+                      (_out_all_norm | regex_findall('STEPFAILMARK::.*'))
+                      | last
+                    ),
+                    true
+                  )
+                | default('', true)
+              }}
+          changed_when: false
+
+        - name: Parse failed step details
+          ansible.builtin.set_fact:
+            failed_step_no: "{{ failed_line | regex_findall('::([0-9]+)::') | last | default('0') }}"
+            failed_step_name: "{{ failed_line | regex_findall('STEPFAILED::[0-9]+::([^:]+?)::') | last | default('Runner/Mapping') }}"
+            failed_step_script: "{{ failed_line | regex_findall('STEPFAILED::[0-9]+::[^:]+::(.*?)::') | last | default('N/A') }}"
+            failed_step_error: "{{ (failed_line.split('::') | last) | default('Unknown failure') }}"
+          changed_when: false
+
+        - name: Extract warnings/errors lists (failure)
+          ansible.builtin.set_fact:
+            warn_lines_fail: "{{ _out_all_norm | regex_findall('(?mi)^.*(?:\\s-W-\\s|^WARNING\\b|Write-Warning|\\bWARN\\b).*$') }}"
+            err_lines_fail:  "{{ _out_all_norm | regex_findall('(?mi)^.*(?:\\s-E-\\s|\\s-A-\\s|\\bFAILED\\b|STEPFAILED::|STEPFAILMARK::).*$') }}"
+          changed_when: false
+
+        - name: Compute warnings/errors counts and tails (failure)
+          ansible.builtin.set_fact:
+            warn_count_fail: "{{ warn_lines_fail | length }}"
+            err_count_fail: "{{ err_lines_fail | length }}"
+            warn_tail_text_fail: "{{ (warn_lines_fail[-60:] | join(nl)) if (warn_lines_fail | length > 0) else 'None' }}"
+            err_tail_text_fail: "{{ (err_lines_fail[-40:] | join(nl)) if (err_lines_fail | length > 0) else 'None' }}"
+            host_out_tail: >-
+              {{
+                (_out_all_norm.splitlines()[-120:] | join(nl))
+                if (_out_all_norm | length > 0)
+                else ''
+              }}
+          changed_when: false
+
+        - name: Send failure email
+          delegate_to: localhost
+          run_once: true
+          ansible.builtin.mail:
+            host: "{{ smtp_host }}"
+            port: "{{ smtp_port }}"
+            secure: "{{ smtp_secure }}"
+            to: "{{ mail_to }}"
+            from: "{{ mail_from }}"
+            subject: "{{ mail_subject_prefix }} FAILED - Step {{ failed_step_no }}: {{ failed_step_name }}"
+            body: |
+              Firco pipeline FAILED.
+
+              Target host: {{ inventory_hostname }}
+              Timestamp (controller): {{ controller_timestamp | default('unknown') }}
+
+              Steps that completed successfully:
+              --------------------------------
+              {{ succeeded_steps_text }}
+
+              Failed step:
+              - Step: {{ failed_step_no }} - {{ failed_step_name }}
+              - Script: {{ failed_step_script }}
+
+              Error:
+              {{ failed_step_error }}
+
+              Warning summary:
+              - Total warnings detected: {{ warn_count_fail }}
+              - Total error-like lines detected: {{ err_count_fail }}
+
+              --- Warnings (last 60) ---
+              {{ warn_tail_text_fail }}
+
+              --- Error-like lines (last 40) ---
+              {{ err_tail_text_fail }}
+
+              --- Runner output tail (last 120 lines) ---
+              {{ host_out_tail }}
+
+        - name: Fail the play after emailing
+          ansible.builtin.fail:
+            msg: "Pipeline stopped because Step {{ failed_step_no | default('0') }} failed. Email notification sent."

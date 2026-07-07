@@ -1,0 +1,501 @@
+---
+- name: Podman + Host health - HTML report and alert-only email (with recovery notification)
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+
+  vars:
+    # ==== Report / Email settings ====
+    report_title: "Podman Container Health"
+    report_path: "/tmp/podman_health_{{ ansible_date_time.iso8601_basic }}.html"
+
+    notify_enabled: true
+    notify_to:
+      - "tienie.vanrooyen@fnb.co.za"
+      # - "Nico.Modiba@fnb.co.za"
+    notify_cc: []
+    notify_subject: "{{ report_title }} - {{ ansible_hostname }} - {{ ansible_date_time.date }} {{ ansible_date_time.time }}"
+    use_local_mta: false
+    smtp_host: "mail.fnb.co.za"
+    smtp_port: 25
+    smtp_starttls: never
+    smtp_from: "croansible@fnb.co.za"
+
+    # Containers without healthchecks should not fail the play unless set true
+    fail_if_no_healthcheck: false
+
+    # ==== Host resource health thresholds ====
+    disk_warn: 80
+    disk_crit: 90
+    mem_warn: 80
+    mem_crit: 90
+    cpu_warn: 75
+    cpu_crit: 90
+
+    # Also fail the play when host resources exceed critical thresholds
+    fail_on_host_alerts: false
+
+    # Ignore noisy/virtual filesystems
+    disk_ignore_fstypes:
+      - tmpfs
+      - devtmpfs
+      - squashfs
+      - overlay
+      - rpc_pipefs
+      - nsfs
+      - autofs
+      - proc
+      - sysfs
+      - cgroup
+      - cgroup2
+      - securityfs
+      - pstore
+      - efivarfs
+      - fusectl
+      - debugfs
+      - mqueue
+      - hugetlbfs
+      - bpf
+      - tracefs
+
+    # State file for change detection (alert <-> ok)
+    state_file_path: "/tmp/pod_health/{{ ansible_hostname }}.json"
+
+  tasks:
+    #################################################################
+    # 1) Containers: list and inspect
+    #################################################################
+    - name: List running containers
+      ansible.builtin.command: sudo podman ps --format json
+      register: containers_raw
+      changed_when: false
+
+    - name: Parse container list
+      ansible.builtin.set_fact:
+        containers_list: "{{ containers_raw.stdout | default('[]') | from_json }}"
+      changed_when: false
+
+    - name: Inspect containers
+      ansible.builtin.command: sudo podman inspect {{ item.Id }} --format json
+      register: inspect_results
+      loop: "{{ containers_list }}"
+      when: containers_list | length > 0
+      changed_when: false
+
+    - name: Init inspect_map
+      ansible.builtin.set_fact:
+        inspect_map: {}
+      changed_when: false
+
+    - name: Map container ID to inspect object
+      ansible.builtin.set_fact:
+        inspect_map: "{{ inspect_map | combine({ obj.Id: obj }) }}"
+      vars:
+        obj: "{{ (item.stdout | from_json)[0] }}"
+      loop: "{{ inspect_results.results | default([]) }}"
+      when: item.stdout is defined and item.stdout | length > 0
+      changed_when: false
+
+    - name: Init containers_enriched
+      ansible.builtin.set_fact:
+        containers_enriched: []
+      changed_when: false
+
+    - name: Merge inspect data into container objects
+      ansible.builtin.set_fact:
+        containers_enriched: >-
+          {{ containers_enriched + [ item | combine({'_inspect': inspect_map.get(item.Id, {})}) ] }}
+      loop: "{{ containers_list }}"
+      when: containers_list | length > 0
+      changed_when: false
+
+    #################################################################
+    # 2) Container health validations (wrapped so notifications still send)
+    #################################################################
+    - name: Container health checks (continue to notifications even if failing)
+      block:
+        - name: Fail if any container unhealthy
+          ansible.builtin.fail:
+            msg: "Container {{ item.Names[0] | default(item.Id[:12]) }} unhealthy: {{ item._inspect.State.Health.Status }}"
+          loop: "{{ containers_enriched }}"
+          when:
+            - item._inspect.State is defined
+            - item._inspect.State.Health is defined
+            - item._inspect.State.Health.Status is defined
+            - item._inspect.State.Health.Status != "healthy"
+
+        - name: Fail if container missing healthcheck
+          ansible.builtin.fail:
+            msg: "Container {{ item.Names[0] | default(item.Id[:12]) }} has no healthcheck configured"
+          loop: "{{ containers_enriched }}"
+          when:
+            - fail_if_no_healthcheck | bool
+            - item._inspect.State is defined
+            - item._inspect.State.Health is not defined
+
+      rescue:
+        - name: Note health failures but continue to report/notify
+          ansible.builtin.debug:
+            msg: "Health check(s) failed; proceeding to generate report and send notifications."
+          changed_when: false
+
+    #################################################################
+    # 3) Host health: Disk / Memory / CPU
+    #################################################################
+    # ---- Disk ----
+    - name: Build disk list
+      ansible.builtin.set_fact:
+        disk_items: "{{ (disk_items | default([])) + [ {
+          'mount': item.mount,
+          'fstype': item.fstype,
+          'total_gb': ((item.size_total | float) / (1024**3)) | round(1),
+          'avail_gb': ((item.size_available | float) / (1024**3)) | round(1),
+          'used_pct': (100 - ((item.size_available | float)/(item.size_total | float) * 100)) | round(1),
+          'status':
+            (
+              (100 - ((item.size_available | float)/(item.size_total | float) * 100)) >= (disk_crit | float)
+            )
+            | ternary('bad',
+              (
+                (100 - ((item.size_available | float)/(item.size_total | float) * 100)) >= (disk_warn | float)
+              )
+              | ternary('warn','ok'))
+        } ] }}"
+      loop: "{{ ansible_mounts | default([]) }}"
+      when:
+        - item.size_total is defined
+        - (item.size_total | int) > 0
+        - (item.fstype | lower) not in (disk_ignore_fstypes | map('lower') | list)
+      changed_when: false
+
+    - name: Sort disks
+      ansible.builtin.set_fact:
+        disk_items_sorted: "{{ disk_items | default([]) | sort(attribute='used_pct', reverse=True) }}"
+      changed_when: false
+
+    # ---- Memory via /proc/meminfo ----
+    - name: Read meminfo
+      ansible.builtin.command: cat /proc/meminfo
+      register: meminfo_raw
+      changed_when: false
+
+    - name: Extract MemTotal and MemAvailable in kB
+      ansible.builtin.set_fact:
+        mem_total_kb: "{{ (meminfo_raw.stdout | regex_findall('(?im)^MemTotal:\\s*(\\d+)') | first | default('0')) | int }}"
+        mem_avail_kb: "{{ (meminfo_raw.stdout | regex_findall('(?im)^MemAvailable:\\s*(\\d+)') | first | default('0')) | int }}"
+      changed_when: false
+
+    - name: Fallback MemAvailable from MemFree+Buffers+Cached when missing
+      ansible.builtin.set_fact:
+        mem_avail_kb: >-
+          {{
+            (meminfo_raw.stdout | regex_findall('(?im)^MemFree:\\s*(\\d+)') | first | default('0')) | int
+            +
+            (meminfo_raw.stdout | regex_findall('(?im)^Buffers:\\s*(\\d+)') | first | default('0')) | int
+            +
+            (meminfo_raw.stdout | regex_findall('(?im)^Cached:\\s*(\\d+)') | first | default('0')) | int
+          }}
+      when: (mem_avail_kb | int) == 0
+      changed_when: false
+
+    - name: Compute memory MB (safe)
+      ansible.builtin.set_fact:
+        mem_total_mb_calc: "{{ (mem_total_kb | int) // 1024 }}"
+        mem_free_mb_calc: "{{ (mem_avail_kb | int) // 1024 }}"
+        mem_used_mb_calc: "{{ ((mem_total_kb | int) - (mem_avail_kb | int)) // 1024 }}"
+      changed_when: false
+
+    - name: Compute memory percent
+      ansible.builtin.set_fact:
+        mem_used_pct: "{{ ((mem_used_mb_calc | float) / ((mem_total_mb_calc | float) or 1) * 100) | round(1) }}"
+      changed_when: false
+
+    - name: Compute memory status
+      ansible.builtin.set_fact:
+        mem_status: "{{ 'bad' if (mem_used_pct | float) >= (mem_crit | float) else ('warn' if (mem_used_pct | float) >= (mem_warn | float) else 'ok') }}"
+      changed_when: false
+
+    # ---- CPU ----
+    - name: Get vCPUs
+      ansible.builtin.set_fact:
+        cpu_vcpus: "{{ ansible_processor_vcpus | default(ansible_facts.processor_vcpus) | default(1) }}"
+      changed_when: false
+
+    - name: Detect loadavg 1m from facts if available
+      ansible.builtin.set_fact:
+        cpu_load1: "{{ ansible_loadavg['1'] | default(ansible_facts.loadavg['1'] | default(None)) }}"
+      changed_when: false
+
+    - name: Fallback read /proc/loadavg when needed
+      ansible.builtin.command: cat /proc/loadavg
+      register: loadavg_raw
+      when: cpu_load1 is none or cpu_load1 == ''
+      changed_when: false
+
+    - name: Parse fallback CPU load
+      ansible.builtin.set_fact:
+        cpu_load1: "{{ loadavg_raw.stdout.split()[0] | float }}"
+      when: cpu_load1 is none or cpu_load1 == ''
+      changed_when: false
+
+    - name: Compute CPU load percent
+      ansible.builtin.set_fact:
+        cpu_load_pct: "{{ ((cpu_load1 | float) / (cpu_vcpus | float) * 100) | round(1) }}"
+      changed_when: false
+
+    - name: Compute CPU status
+      ansible.builtin.set_fact:
+        cpu_status: "{{ 'bad' if (cpu_load_pct | float) >= (cpu_crit | float) else ('warn' if (cpu_load_pct | float) >= (cpu_warn | float) else 'ok') }}"
+      changed_when: false
+
+    #################################################################
+    # 4) Podman storage usage
+    #################################################################
+    - name: Get Podman system df JSON
+      ansible.builtin.command: sudo podman system df --format json
+      register: podman_df_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Parse Podman df JSON
+      ansible.builtin.set_fact:
+        podman_df: "{{ (podman_df_raw.stdout | default('{}')) | from_json | default({}, true) }}"
+      changed_when: false
+
+    - name: Build podman_storage summary
+      ansible.builtin.set_fact:
+        podman_storage:
+          images_count: "{{ (podman_df.Images | default([])) | length }}"
+          containers_count: "{{ (podman_df.Containers | default([])) | length }}"
+          volumes_count: "{{ (podman_df.Volumes | default([])) | length }}"
+          layers_size_gb: "{{ ((podman_df.LayersSize | default(0) | float) / (1024**3)) | round(2) }}"
+      changed_when: false
+
+    #################################################################
+    # 5) Build host_health object
+    #################################################################
+    - name: Build final host_health
+      ansible.builtin.set_fact:
+        host_health:
+          disk:
+            items: "{{ disk_items_sorted | default([]) }}"
+            worst_used_pct: "{{ (disk_items_sorted | first).used_pct if (disk_items_sorted | length) > 0 else 0 }}"
+            status: >-
+              {{
+                (disk_items_sorted | selectattr('status','equalto','bad') | list | length > 0)
+                | ternary('bad',
+                  (disk_items_sorted | selectattr('status','equalto','warn') | list | length > 0)
+                  | ternary('warn','ok'))
+              }}
+          memory:
+            total_mb: "{{ mem_total_mb_calc }}"
+            used_mb: "{{ mem_used_mb_calc }}"
+            used_pct: "{{ mem_used_pct }}"
+            status: "{{ mem_status }}"
+          cpu:
+            vcpus: "{{ cpu_vcpus }}"
+            load1: "{{ cpu_load1 }}"
+            load_pct: "{{ cpu_load_pct }}"
+            status: "{{ cpu_status }}"
+          podman_storage: "{{ podman_storage }}"
+      changed_when: false
+
+    #################################################################
+    # 6) Optional fail on host alerts (wrapped so notifications still send)
+    #################################################################
+    - name: Host critical threshold checks (continue to notifications even if failing)
+      block:
+        - name: Fail when host critical thresholds are exceeded
+          ansible.builtin.fail:
+            msg: >
+              HOST HEALTH ALERT:
+              CPU={{ cpu_load_pct }}% ({{ cpu_status }}),
+              MEM={{ mem_used_pct }}% ({{ mem_status }}),
+              DISK worst={{ host_health.disk.worst_used_pct }}% ({{ host_health.disk.status }})
+          when:
+            - fail_on_host_alerts | bool
+            - cpu_status == 'bad' or mem_status == 'bad' or
+              (host_health.disk['items'] | selectattr('status','equalto','bad') | list | length) > 0
+
+      rescue:
+        - name: Note host threshold failure but continue to report/notify
+          ansible.builtin.debug:
+            msg: "Host threshold(s) failed; proceeding to generate report and send notifications."
+          changed_when: false
+
+    #################################################################
+    # 7) Count containers, compute states, and detect transitions
+    #################################################################
+    - name: Compute container summary numbers
+      ansible.builtin.set_fact:
+        cont_total: "{{ (containers_enriched | length) | int }}"
+        cont_running: "{{ (containers_enriched | selectattr('State','equalto','running') | list | length) | int }}"
+        cont_with_health: "{{ (containers_enriched | selectattr('_inspect.State.Health','defined') | list | length) | int }}"
+        cont_healthy: "{{ (containers_enriched | selectattr('_inspect.State.Health.Status','defined') | selectattr('_inspect.State.Health.Status','equalto','healthy') | list | length) | int }}"
+      changed_when: false
+
+    - name: Derive current state based on rules (alert when exactly 1 running)
+      ansible.builtin.set_fact:
+        current_state: "{{ 'ok' if (cont_running | int) >= 2 else ('alert' if (cont_running | int) == 1 else 'ok') }}"
+      changed_when: false
+
+    - name: Ensure state file directory exists
+      ansible.builtin.file:
+        path: "{{ state_file_path | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Read previous state file if present
+      ansible.builtin.stat:
+        path: "{{ state_file_path }}"
+      register: state_file_stat
+
+    - name: Load previous state content
+      ansible.builtin.slurp:
+        path: "{{ state_file_path }}"
+      register: state_file_slurp
+      when: state_file_stat.stat.exists
+
+    - name: Parse previous state
+      ansible.builtin.set_fact:
+        prev_state_obj: "{{ (state_file_slurp.content | b64decode | from_json) if state_file_stat.stat.exists else {} }}"
+      changed_when: false
+
+    - name: Set previous state defaults (first run safe)
+      ansible.builtin.set_fact:
+        prev_state: "{{ prev_state_obj.last_state | default('ok') }}"
+        prev_count: "{{ prev_state_obj.last_count | default(2) }}"
+      changed_when: false
+
+    - name: Decide transition actions
+      ansible.builtin.set_fact:
+        send_alert: "{{ (current_state == 'alert') and (prev_state != 'alert') }}"
+        send_recovery: "{{ (current_state == 'ok') and (prev_state == 'alert') }}"
+      changed_when: false
+
+    - name: Build HTML list of running containers (for recovery email)
+      ansible.builtin.set_fact:
+        running_list_html: |-
+          <ul>
+          {% for c in containers_enriched if c.State == 'running' %}
+            <li>{{ c.Names[0] | default(c.Id[:12]) }} (image: {{ c.Image | default(c.ImageName | default('unknown')) }})</li>
+          {% endfor %}
+          </ul>
+      changed_when: false
+
+    #################################################################
+    # 8) Render HTML report (always generates the file on disk)
+    #################################################################
+    - name: Render HTML report
+      ansible.builtin.template:
+        src: container_health_report.html.j2
+        dest: "{{ report_path }}"
+        mode: "0644"
+      vars:
+        report_host: "{{ ansible_hostname }}"
+        report_time: "{{ ansible_date_time.date }} {{ ansible_date_time.time }}"
+        rows_ctx: "{{ containers_enriched }}"
+        host_health_ctx: "{{ host_health }}"
+        disk_warn_ctx: "{{ disk_warn }}"
+        disk_crit_ctx: "{{ disk_crit }}"
+        podman_storage_ctx: "{{ podman_storage }}"
+
+    - name: Show report path
+      ansible.builtin.debug:
+        msg: "Report saved: {{ report_path }}"
+
+    #################################################################
+    # 9) Emails — send only on transitions
+    #################################################################
+    - name: Build ALERT email content (transition into alert)
+      ansible.builtin.set_fact:
+        alert_subject: "ALERT: Only 1 container running on {{ ansible_hostname }} (target 2)"
+        alert_body_html: |-
+          <html>
+          <body>
+          <h3>Pod/Container Availability ALERT</h3>
+          <p><b>Host:</b> {{ ansible_hostname }}</p>
+          <p><b>Time:</b> {{ ansible_date_time.date }} {{ ansible_date_time.time }}</p>
+          <p><b>Status:</b> <span style="color:red;">1 container below target (running {{ cont_running }} of 2)</span></p>
+          <hr/>
+          <p>Host Health - CPU: {{ cpu_load_pct }}% ({{ cpu_status }}), MEM: {{ mem_used_pct }}% ({{ mem_status }}), DISK worst: {{ host_health.disk.worst_used_pct }}% ({{ host_health.disk.status }})</p>
+          <p>Containers - running {{ cont_running }}/{{ cont_total }}, healthy {{ cont_healthy }}, with healthchecks {{ cont_with_health }}</p>
+          </body>
+          </html>
+      when: send_alert | bool
+      changed_when: false
+
+    - name: Send ALERT via local MTA
+      ansible.builtin.mail:
+        to: "{{ notify_to | join(',') }}"
+        cc: "{{ notify_cc | join(',') if notify_cc | length > 0 else omit }}"
+        subject: "{{ alert_subject }}"
+        body: "{{ alert_body_html }}"
+        subtype: html
+        from: "{{ smtp_from }}"
+      when: notify_enabled and use_local_mta and (send_alert | bool)
+
+    - name: Send ALERT via SMTP
+      community.general.mail:
+        to: "{{ notify_to | join(',') }}"
+        cc: "{{ notify_cc | join(',') if notify_cc | length > 0 else omit }}"
+        subject: "{{ alert_subject }}"
+        body: "{{ alert_body_html }}"
+        subtype: html
+        from: "{{ smtp_from }}"
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        secure: never
+      when: notify_enabled and (not use_local_mta) and (send_alert | bool)
+
+    - name: Build RECOVERY email content (transition back to ok)
+      ansible.builtin.set_fact:
+        recovery_subject: "RECOVERED: {{ ansible_hostname }} back to target ({{ cont_running }} running)"
+        recovery_body_html: |-
+          <html>
+          <body>
+          <h3>Pod/Container Availability RECOVERY</h3>
+          <p><b>Host:</b> {{ ansible_hostname }}</p>
+          <p><b>Time:</b> {{ ansible_date_time.date }} {{ ansible_date_time.time }}</p>
+          <p><b>Status:</b> <span style="color:green;">Containers back at or above target</span></p>
+          <p><b>Running count:</b> {{ cont_running }}</p>
+          <p><b>Currently running containers:</b></p>
+          {{ running_list_html }}
+          <hr/>
+          <p>Host Health - CPU: {{ cpu_load_pct }}% ({{ cpu_status }}), MEM: {{ mem_used_pct }}% ({{ mem_status }}), DISK worst: {{ host_health.disk.worst_used_pct }}% ({{ host_health.disk.status }})</p>
+          </body>
+          </html>
+      when: send_recovery | bool
+      changed_when: false
+
+    - name: Send RECOVERY via local MTA
+      ansible.builtin.mail:
+        to: "{{ notify_to | join(',') }}"
+        cc: "{{ notify_cc | join(',') if notify_cc | length > 0 else omit }}"
+        subject: "{{ recovery_subject }}"
+        body: "{{ recovery_body_html }}"
+        subtype: html
+        from: "{{ smtp_from }}"
+      when: notify_enabled and use_local_mta and (send_recovery | bool)
+
+    - name: Send RECOVERY via SMTP
+      community.general.mail:
+        to: "{{ notify_to | join(',') }}"
+        cc: "{{ notify_cc | join(',') if notify_cc | length > 0 else omit }}"
+        subject: "{{ recovery_subject }}"
+        body: "{{ recovery_body_html }}"
+        subtype: html
+        from: "{{ smtp_from }}"
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        secure: never
+      when: notify_enabled and (not use_local_mta) and (send_recovery | bool)
+
+    #################################################################
+    # 10) Persist current state for next run
+    #################################################################
+    - name: Save current state to file
+      ansible.builtin.copy:
+        dest: "{{ state_file_path }}"
+        mode: "0644"
+        content: "{{ {'last_state': current_state, 'last_count': cont_running, 'time': ansible_date_time.iso8601 } | to_json }}"
