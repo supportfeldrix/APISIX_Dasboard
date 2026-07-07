@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pod-health-reports-pvc
+  namespace: cro-apisix-uat
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: dorado-nfs-csi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-health-reporter
+  namespace: cro-apisix-uat
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-health-reporter-view
+  namespace: cro-apisix-uat
+subjects:
+  - kind: ServiceAccount
+    name: pod-health-reporter
+    namespace: cro-apisix-uat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-pod-health-report
+  namespace: cro-apisix-uat
+spec:
+  schedule: "0 7 * * *"   # Runs at 07:00 every morning
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: pod-health-reporter
+          restartPolicy: Never
+          volumes:
+            - name: reports
+              persistentVolumeClaim:
+                claimName: pod-health-reports-pvc
+          containers:
+            - name: reporter
+              image: quay.io/openshift/origin-cli:4.14
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+
+                  REPORT_DIR="/reports"
+                  DATE="$(date +%Y-%m-%d)"
+                  REPORT_FILE="${REPORT_DIR}/${DATE}.txt"
+
+                  echo "Generating pod health report for ${DATE}" > "$REPORT_FILE"
+                  echo "Namespace: cro-apisix-uat" >> "$REPORT_FILE"
+                  echo "-------------------------------------------" >> "$REPORT_FILE"
+                  echo "" >> "$REPORT_FILE"
+
+                  # Summary
+                  echo "[SUMMARY – ALL PODS]" >> "$REPORT_FILE"
+                  oc get pods -n cro-apisix-uat -o wide >> "$REPORT_FILE"
+                  echo "" >> "$REPORT_FILE"
+
+                  # Identify unhealthy pods
+                  echo "[UNHEALTHY PODS]" >> "$REPORT_FILE"
+                  UNHEALTHY="$(oc get pods -n cro-apisix-uat --no-headers | awk '$2!=$3 || $3!="Running" {print}')"
+
+                  if [[ -z "$UNHEALTHY" ]]; then
+                    echo "All pods are healthy ✔" >> "$REPORT_FILE"
+                  else
+                    echo "$UNHEALTHY" >> "$REPORT_FILE"
+                  fi
+
+                  echo "" >> "$REPORT_FILE"
+                  echo "Report saved to ${REPORT_FILE}"
+                  echo "Done."
+              volumeMounts:
+                - name: reports
+                  mountPath: /reports

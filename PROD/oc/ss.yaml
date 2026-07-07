@@ -1,0 +1,231 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  creationTimestamp: "2025-10-21T07:23:16Z"
+  generation: 75
+  labels:
+    app.kubernetes.io/component: api-gateway
+    app.kubernetes.io/instance: apisix-prod
+    app.kubernetes.io/name: apisix
+    app.kubernetes.io/part-of: lumos-foundation
+    app.kubernetes.io/version: 3.14.0-redhat
+  name: apisix
+  namespace: cro-apisix-prod
+  resourceVersion: "2145866098"
+  uid: 56910565-44cc-4dd4-8917-838d57bf80a5
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  podManagementPolicy: OrderedReady
+  replicas: 2
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: apisix
+  serviceName: apisix
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: apisix
+    spec:
+      containers:
+      - env:
+        - name: TZ
+          value: Africa/Johannesburg
+        - name: APISIX_DEPLOYMENT_ETCD_HOST
+          value: '["http://apisix-etcd.cro-apisix-prod.svc.cluster.local:2379"]'
+        image: apache/apisix:3.14.0-redhat
+        imagePullPolicy: Always
+        name: apisix
+        ports:
+        - containerPort: 9080
+          name: http
+          protocol: TCP
+        - containerPort: 9092
+          name: admin
+          protocol: TCP
+        - containerPort: 9091
+          name: prometheus
+          protocol: TCP
+        resources:
+          limits:
+            cpu: "1"
+            memory: 4Gi
+          requests:
+            cpu: 250m
+            memory: 3Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/local/apisix/conf
+          name: apisix-conf
+        - mountPath: /usr/local/apisix/logs
+          name: apisix-logs
+        - mountPath: /usr/local/apisix/conf/mime.types
+          name: apisix-mime-types
+          subPath: mime.types
+        - mountPath: /usr/local/apisix/client_body_temp
+          name: apisix-client-body-temp
+        - mountPath: /usr/local/apisix/proxy_temp
+          name: apisix-proxy-temp
+        - mountPath: /usr/local/apisix/fastcgi_temp
+          name: apisix-fastcgi-temp
+        - mountPath: /usr/local/apisix/uwsgi_temp
+          name: apisix-uwsgi-temp
+        - mountPath: /usr/local/apisix/scgi_temp
+          name: apisix-scgi-temp
+      dnsPolicy: ClusterFirst
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - |
+          set -e
+          cp /bootstrap/config.yaml /usr/local/apisix/conf/config.yaml
+          chmod 0644 /usr/local/apisix/conf/config.yaml
+        image: registry.access.redhat.com/ubi8/ubi-minimal
+        imagePullPolicy: Always
+        name: bootstrap-config
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /bootstrap
+          name: apisix-config
+        - mountPath: /usr/local/apisix/conf
+          name: apisix-conf
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - configMap:
+          defaultMode: 420
+          name: apisix-config
+        name: apisix-config
+      - configMap:
+          defaultMode: 420
+          name: apisix-mime-types
+        name: apisix-mime-types
+  updateStrategy:
+    rollingUpdate:
+      partition: 0
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      creationTimestamp: null
+      name: apisix-logs
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: dorado-nfs-csi
+      volumeMode: Filesystem
+    status:
+      phase: Pending
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      creationTimestamp: null
+      name: apisix-conf
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: dorado-nfs-csi
+      volumeMode: Filesystem
+    status:
+      phase: Pending
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      creationTimestamp: null
+      name: apisix-client-body-temp
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: dorado-nfs-csi
+      volumeMode: Filesystem
+    status:
+      phase: Pending
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      creationTimestamp: null
+      name: apisix-proxy-temp
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: dorado-nfs-csi
+      volumeMode: Filesystem
+    status:
+      phase: Pending
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      creationTimestamp: null
+      name: apisix-fastcgi-temp
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: dorado-nfs-csi
+      volumeMode: Filesystem
+    status:
+      phase: Pending
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      creationTimestamp: null
+      name: apisix-uwsgi-temp
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: dorado-nfs-csi
+      volumeMode: Filesystem
+    status:
+      phase: Pending
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      creationTimestamp: null
+      name: apisix-scgi-temp
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: dorado-nfs-csi
+      volumeMode: Filesystem
+    status:
+      phase: Pending
+status:
+  availableReplicas: 2
+  collisionCount: 0
+  currentReplicas: 2
+  currentRevision: apisix-664f8898
+  observedGeneration: 75
+  readyReplicas: 2
+  replicas: 2
+  updateRevision: apisix-664f8898
+  updatedReplicas: 2

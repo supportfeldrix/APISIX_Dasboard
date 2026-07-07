@@ -1,0 +1,44 @@
+apisix:
+  node_listen: 9080
+  enable_ipv6: false
+  enable_dev_mode: false
+  allow_admin:
+    - 127.0.0.0/24
+    - 192.168.0.0/16
+    - 10.0.0.0/8
+  admin_key:
+    - name: "admin"
+      key: edd1c9f034335f136f87ad84b625c8f1
+      role: admin
+    - name: "viewer"
+      key: 4054f7cf07e344346cd3f287985e76a2
+      role: viewer
+  enable_control: true
+  control:
+    ip: "0.0.0.0"
+    port: 9092
+  ssl:
+    enable: false
+
+deployment:
+  admin:
+    allow_admin:
+      - 127.0.0.0/24
+      - 192.168.0.0/16
+      - 10.0.0.0/8
+
+authentication:
+  issuerMapping:
+    "http://cro-apisix-keycloak-prod.apps.prod-01-rb.ocp.fnb.co.za:9080/realms/actimize": "https://cro-apisix-keycloak-prod.apps.prod-01-rb.ocp.fnb.co.za/realms/actimize/protocol/openid-connect/certs"
+
+etcd:
+  host:
+    - "http://apisix-etcd.cro-apisix-prod.svc.cluster.local:2379"
+  prefix: "/apisix"
+  timeout: 30
+
+plugin_attr:
+  prometheus:
+    export_addr:
+      ip: "0.0.0.0"
+      port: 9091

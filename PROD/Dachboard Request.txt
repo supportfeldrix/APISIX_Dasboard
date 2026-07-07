@@ -1,0 +1,118 @@
+Custom Apache APISIX Dashboard – Project Description & Requirements
+Background
+I am currently running Apache APISIX version 3.1.14 on OpenShift and using the built‑in APISIX Dashboard. While functional, the default dashboard is not user‑friendly and does not meet the needs of our Business and DevOps users, who require a simpler, more controlled interface to view and manage APISIX configurations.
+To address this, I would like to design and build a custom APISIX dashboard that interacts directly with the APISIX Admin API via REST calls, providing a secure and intuitive management experience.
+
+Objective
+Create a custom APISIX management dashboard that:
+
+Is easy to use for Business and DevOps users
+Supports role‑based access (view vs admin)
+Can be run locally first, then deployed into OpenShift
+Integrates with LDAP for authentication and authorization
+Uses REST APIs only (no direct etcd access)
+Also have a dashboard tab to view memory and cpu usage on the pods listed in openshift via the prometheus metrics setup api 
+
+
+Initial Authentication Requirements (Local Development)
+For local testing and development only, the dashboard should support local authentication with:
+
+Username: admin
+Password: N03ntry#
+Login and Logout functionality
+Session‑based or token‑based access control
+
+
+This local authentication will later be replaced or extended by LDAP integration.
+
+
+Functional Requirements
+The dashboard must allow users to manage APISIX resources via the APISIX Admin API, including:
+Core Resources
+
+Routes
+
+Create, view, update, ,disable ,enable and delete routes
+Ability to define routes using:
+
+YAML
+JSON
+
+
+Similar experience to newer third‑party or modern APISIX dashboards
+
+
+
+Services
+
+
+Upstreams
+
+
+Consumers
+
+
+Plugins & Policies
+
+Plugins
+
+Manage plugins per:
+
+Route
+Service
+Consumer
+
+
+
+
+Global Rules
+Plugin Metadata
+
+Security & TLS
+
+SSL Certificates
+
+Upload and manage TLS certificates used by APISIX
+
+
+
+
+Technical Constraints
+
+All configuration must be managed only via REST calls to:
+
+APISIX Admin API
+
+
+No direct writes to etcd
+The dashboard should not expose Admin API credentials to the browser
+
+
+Platform Details
+
+Runtime Environment: OpenShift (deployment phase)
+Initial Environment: Local development (Windows Laptop for localhost)
+Existing APISIX Metrics Endpoint:
+
+https://apisix-metrics-route-cro-apisix-uat.apps.dev-02-rb.ocp.fnb.co.za/apisix/prometheus/metrics
+
+(This endpoint is currently used for monitoring and visibility.)
+
+Security & Access Control (Phase 2)
+Once the dashboard is stable and tested:
+LDAP Integration
+
+Integrate dashboard authentication with the company’s LDAP
+Support multiple roles:
+
+View‑only users
+Admin users
+
+
+
+Admin Approval Flow
+
+A local admin user must be able to:
+
+Grant ADMIN access to other users
+Only after Manager approval (process‑controlled, not automated)

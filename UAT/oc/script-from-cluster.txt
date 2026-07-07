@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SMTP_HOST="${SMTP_HOST:-}"
+SMTP_PORT="${SMTP_PORT:-25}"
+SMTP_SECURITY="${SMTP_SECURITY:-none}"
+SMTP_USER="${SMTP_USER:-}"
+SMTP_PASS="${SMTP_PASS:-}"
+
+EMAIL_TO="${EMAIL_TO:-}"
+EMAIL_FROM="${EMAIL_FROM:-}"
+SUBJECT_PREFIX="${SUBJECT_PREFIX:-[OpenShift Pod Health]}"
+TARGET_NAMESPACES="${TARGET_NAMESPACES:-}"
+
+if [[ -z "$SMTP_HOST" || -z "$EMAIL_TO" || -z "$EMAIL_FROM" ]]; then
+  echo "Missing required SMTP_HOST/EMAIL_TO/EMAIL_FROM" >&2
+  exit 1
+fi
+if [[ -z "$TARGET_NAMESPACES" ]]; then
+  echo "TARGET_NAMESPACES is empty. Provide a comma-separated list in the Secret." >&2
+  exit 1
+fi
+
+# Derive envelope sender (plain address) from EMAIL_FROM header value
+# If EMAIL_FROM contains <addr@domain>, extract addr@domain; else use whole value
+if [[ "$EMAIL_FROM" =~ <([^>]+)> ]]; then
+  ENVELOPE_FROM="${BASH_REMATCH[1]}"
+else
+  ENVELOPE_FROM="$EMAIL_FROM"
+fi
+
+NOW="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+CLUSTER="$(oc whoami --show-server 2>/dev/null || echo 'unknown')"
+HEADER="Pod Health Report — ${NOW}\nCluster: ${CLUSTER}\nNamespaces: ${TARGET_NAMESPACES}\n"
+
+NON_HEALTHY=""
+SUMMARY=""
+
+IFS=',' read -ra NAMESPACES <<< "$TARGET_NAMESPACES"
+for ns in "${NAMESPACES[@]}"; do
+  ns="$(echo "$ns" | xargs)"
+  [[ -z "$ns" ]] && continue
+
+  POD_LINES="$(oc get pods -n "$ns" --no-headers 2>/dev/null || true)"
+  if [[ -z "$POD_LINES" ]]; then
+    SUMMARY+=$'\n'"[${ns}] No pods found or access denied."
+    continue
+  fi
+
+  SUMMARY+=$'\n'"[${ns}]"
+  SUMMARY+=$'\n'"$(oc get pods -n "$ns" -o wide)"
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    name="$(echo $line | awk '{print $1}')"     # ns-scoped 'oc get pods' => NAME first
+    ready="$(echo $line | awk '{print $2}')"
+    status="$(echo $line | awk '{print $3}')"
+
+    if [[ "$ready" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+      cur="${BASH_REMATCH[1]}"; des="${BASH_REMATCH[2]}"
+      if [[ "$cur" != "$des" ]]; then
+        NON_HEALTHY+="$ns $name READY=$ready STATUS=$status"$'\n'
+      fi
+    else
+      # Unexpected format — flag it for visibility
+      NON_HEALTHY+="$ns $name READY=$ready STATUS=$status"$'\n'
+    fi
+
+    if [[ "$status" != "Running" ]]; then
+      NON_HEALTHY+="$ns $name READY=$ready STATUS=$status"$'\n'
+    fi
+  done <<< "$POD_LINES"
+done
+
+if [[ -n "$NON_HEALTHY" ]]; then
+  NON_HEALTHY="$(printf "%s" "$NON_HEALTHY" | awk '!seen[$0]++')"
+  COUNT="$(printf "%s" "$NON_HEALTHY" | grep -c . || echo 0)"
+  SUBJECT="${SUBJECT_PREFIX} ALERT: ${COUNT} pod(s) not healthy"
+  BODY="${HEADER}\nSome pods are not healthy:\n\n${NON_HEALTHY}\n\nSummary:\n${SUMMARY}"
+else
+  SUBJECT="${SUBJECT_PREFIX} OK: all pods healthy"
+  BODY="${HEADER}\nAll pods are Running and Ready.\n\nSummary:\n${SUMMARY}"
+fi
+
+# Build RFC822 email (plain text) with CRLF endings
+TMP_MSG="$(mktemp)"
+{
+  printf "From: %s\r\n" "$EMAIL_FROM"
+  printf "To: %s\r\n" "$EMAIL_TO"
+  printf "Subject: %s\r\n" "$SUBJECT"
+  printf "MIME-Version: 1.0\r\n"
+  printf "Content-Type: text/plain; charset=UTF-8\r\n"
+  printf "Content-Transfer-Encoding: 8bit\r\n"
+  printf "\r\n"
+  printf "%s" "$BODY" | tr -d '\r' | sed 's/$/\r/'
+} > "$TMP_MSG"
+
+# Configure SMTP URL and TLS
+URL="smtp://${SMTP_HOST}:${SMTP_PORT}"
+CURL_TLS_ARGS=()
+case "$SMTP_SECURITY" in
+  starttls) CURL_TLS_ARGS+=(--ssl-reqd) ;;              # explicit STARTTLS on smtp://
+  ssl) URL="smtps://${SMTP_HOST}:${SMTP_PORT}" ;;       # implicit SSL on smtps:// (e.g., 465)
+  none) ;;                                              # no TLS
+  *) echo "Unknown SMTP_SECURITY: $SMTP_SECURITY" >&2; exit 1 ;;
+esac
+
+# Optional auth
+AUTH_ARGS=()
+if [[ -n "${SMTP_USER}" && -n "${SMTP_PASS}" ]]; then
+  AUTH_ARGS=(-u "${SMTP_USER}:${SMTP_PASS}")
+fi
+
+# Support comma-separated recipients
+IFS=',' read -ra RCPTS <<< "$EMAIL_TO"
+RCPT_ARGS=()
+for r in "${RCPTS[@]}"; do
+  r="$(echo "$r" | xargs)"; [[ -n "$r" ]] && RCPT_ARGS+=(--mail-rcpt "$r")
+done
+
+set -x
+curl -sS --url "$URL" \
+  "${AUTH_ARGS[@]}" \
+  "${CURL_TLS_ARGS[@]}" \
+  --mail-from "$ENVELOPE_FROM" \
+  "${RCPT_ARGS[@]}" \
+  --upload-file "$TMP_MSG"
+set +x
+
+echo "Report sent: ${SUBJECT}"

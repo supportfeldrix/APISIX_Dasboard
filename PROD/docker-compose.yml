@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: apisix-dashboard-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - backend_data:/app/data
+    restart: unless-stopped
+    networks:
+      - apisix-dashboard
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: apisix-dashboard-frontend
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - apisix-dashboard
+
+volumes:
+  backend_data:
+
+networks:
+  apisix-dashboard:
+    driver: bridge

@@ -1,0 +1,327 @@
+# =============================================================================
+# CRO IT APISIX Dashboard - OpenShift Deployment
+# Namespace: cro-apisix-prod
+# Route: https://cro-apisix-admin-ui-uat.apps.dev-02-rb.ocp.fnb.co.za
+#
+# Usage:
+#   oc apply -f openshift-deploy.yaml -n cro-apisix-prod
+#
+# Prerequisites:
+#   - Backend and frontend images pushed to the internal registry
+#   - Or use the BuildConfig sections below to build from source
+# =============================================================================
+
+---
+# 1. Service Account for pod metrics access
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: apisix-dashboard-sa
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+
+---
+# 2. RoleBinding - allow SA to view pods and metrics in the namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: apisix-dashboard-view
+  namespace: cro-apisix-prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: apisix-dashboard-sa
+    namespace: cro-apisix-prod
+
+---
+# 3. Secret - sensitive configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: apisix-dashboard-secrets
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+type: Opaque
+stringData:
+  JWT_SECRET: "prod-croit-dashboard-jwt-secret-2026-strong-key"
+  APISIX_ADMIN_KEY: "yuJuRquLpqMJhXsIzyWlOCWeQTbMAOGi"
+  LDAP_BIND_PASSWORD: "InwxvJ.NWkaYf*1s"
+
+---
+# 4. ConfigMap - non-sensitive configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apisix-dashboard-config
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+data:
+  # APISIX Admin API - use stable service DNS (not pod IP which can change on restart)
+  APISIX_ADMIN_BASE_URL: "http://apisix-admin-api.cro-apisix-prod.svc.cluster.local:9180"
+  APISIX_ADMIN_VERIFY_SSL: "false"
+  APISIX_ADMIN_TIMEOUT: "10"
+
+  # Prometheus metrics - internal service DNS
+  APISIX_METRICS_URL: "http://apisix-metrics.cro-apisix-prod.svc.cluster.local:9091/apisix/prometheus/metrics"
+  APISIX_METRICS_TIMEOUT: "10"
+
+  # JWT
+  JWT_ALGORITHM: "HS256"
+  JWT_EXPIRY_MINUTES: "30"
+
+  # Database (SQLite on PVC)
+  DATABASE_URL: "sqlite:////app/data/apisix_dashboard.db"
+
+  # LDAP
+  LDAP_ENABLED: "true"
+  LDAP_SERVER: "ldaps://ldap.fnbconnect.co.za:636"
+  LDAP_BASE_DN: "DC=fnb,DC=co,DC=za"
+  LDAP_USER_FILTER: "(&(objectClass=user)(sAMAccountName={username}))"
+  LDAP_BIND_DN: "SVC_cro_ansible_dev@fnb.co.za"
+  LDAP_GROUP_BASE_DN: "OU=GlobalSecurityGroups,OU=DomainGroups,DC=fnb,DC=co,DC=za"
+  LDAP_ADMIN_GROUP: ""
+  LDAP_USE_SSL: "true"
+  LDAP_VERIFY_SSL: "false"
+
+  # OpenShift API (for pod monitoring)
+  OC_API_SERVER: "https://api.prod-01-rb.ocp.fnb.co.za:6443"
+  OC_NAMESPACE: "cro-apisix-prod"
+  OC_VERIFY_SSL: "false"
+
+  # Server
+  CORS_ORIGINS: "https://cro-apisix-croit-dashboard-prod.apps.prod-01-rb.ocp.fnb.co.za"
+  ROOT_PATH: ""
+  LOG_LEVEL: "INFO"
+
+  # SMTP (Email Notifications)
+  SMTP_HOST: "mail.fnb.co.za"
+  SMTP_PORT: "25"
+  SMTP_USERNAME: ""
+  SMTP_PASSWORD: ""
+  SMTP_FROM_ADDRESS: "cromonitor@fnb.co.za"
+  SMTP_USE_TLS: "true"
+  SMTP_VERIFY_SSL: "false"
+
+  # Notification Scheduler
+  NOTIFICATION_EVAL_INTERVAL: "60"
+  NOTIFICATION_LOG_RETENTION_DAYS: "90"
+
+  # Version Check (GitHub via corporate proxy)
+  GITHUB_API_TIMEOUT: "15"
+  GITHUB_PROXY_URL: "http://htf-cobbler.fnb.co.za:8080"
+  VERSION_CHECK_INTERVAL_HOURS: "24"
+
+  # Application Environment
+  APP_ENVIRONMENT: "PROD"
+
+---
+# 5. PersistentVolumeClaim for SQLite database
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: apisix-dashboard-db
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+spec:
+  storageClassName: dorado-nfs-csi
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# 6. Backend Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apisix-dashboard-backend
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+    component: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apisix-dashboard
+      component: backend
+  template:
+    metadata:
+      labels:
+        app: apisix-dashboard
+        component: backend
+    spec:
+      serviceAccountName: apisix-dashboard-sa
+      containers:
+        - name: backend
+          image: image-registry.openshift-image-registry.svc:5000/cro-apisix-prod/apisix-dashboard-backend:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: apisix-dashboard-config
+            - secretRef:
+                name: apisix-dashboard-secrets
+          env:
+            # Inject the service account token for K8s API access
+            - name: OC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: apisix-dashboard-secrets
+                  key: JWT_SECRET
+                  optional: true
+          volumeMounts:
+            - name: db-storage
+              mountPath: /app/data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+      volumes:
+        - name: db-storage
+          persistentVolumeClaim:
+            claimName: apisix-dashboard-db
+
+---
+# 7. Backend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix-dashboard-backend
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+    component: backend
+spec:
+  selector:
+    app: apisix-dashboard
+    component: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP
+
+---
+# 8. Frontend Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apisix-dashboard-frontend
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+    component: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apisix-dashboard
+      component: frontend
+  template:
+    metadata:
+      labels:
+        app: apisix-dashboard
+        component: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: image-registry.openshift-image-registry.svc:5000/cro-apisix-prod/apisix-dashboard-frontend:1.0.0
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+
+---
+# 9. Frontend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix-dashboard-frontend
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+    component: frontend
+spec:
+  selector:
+    app: apisix-dashboard
+    component: frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+
+---
+# 10. Route - HTTPS with TLS edge termination
+# URL: https://cro-apisix-croit-dashboard-prod.apps.prod-01-rb.ocp.fnb.co.za
+# NOTE: The existing route 'apisix-embedded-dashboard' uses cro-apisix-admin-ui-uat.apps...
+#       We use a separate hostname to avoid conflict. Once tested, you can switch.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: apisix-croit-dashboard
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-dashboard
+  annotations:
+    haproxy.router.openshift.io/timeout: 60s
+spec:
+  host: cro-apisix-croit-dashboard-prod.apps.prod-01-rb.ocp.fnb.co.za
+  to:
+    kind: Service
+    name: apisix-dashboard-frontend
+    weight: 100
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

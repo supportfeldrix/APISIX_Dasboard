@@ -1,0 +1,211 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-status-reporter
+  namespace: cro-apisix-uat
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-status-reporter-view
+  namespace: cro-apisix-uat
+subjects:
+  - kind: ServiceAccount
+    name: pod-status-reporter
+    namespace: cro-apisix-uat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pod-status-smtp-secret
+  namespace: cro-apisix-uat
+type: Opaque
+stringData:
+  # SMTP relay (internal, no auth)
+  SMTP_HOST: "mail.fnb.co.za"
+  SMTP_PORT: "25"
+  SMTP_SECURITY: "starttls"
+  SMTP_USER: ""
+  SMTP_PASS: ""
+
+  # Email addressing
+  # Use a friendly display From for the header:
+  EMAIL_FROM: "OpenShift Reporter <no-reply-cro-openshift@fnb.co.za>"
+  # Provide a plain envelope sender for SMTP (no angle brackets, no display name):
+  ENVELOPE_FROM: "no-reply-cro-openshift@fnb.co.za"
+  EMAIL_TO: "tienie.vanrooyen@fnb.co.za"
+
+  # Subject prefix
+  SUBJECT_PREFIX: "[OpenShift Pod Health]"
+
+  # Namespaces to scan (comma-separated)
+  TARGET_NAMESPACES: "cro-apisix-uat"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pod-status-email-report-once
+  namespace: cro-apisix-uat
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      namespace: cro-apisix-uat
+    spec:
+      serviceAccountName: pod-status-reporter
+      restartPolicy: Never
+      volumes:
+        - name: work
+          emptyDir: {}
+      initContainers:
+        - name: write-script
+          image: quay.io/openshift/origin-cli:4.14
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              cat << 'EOF' > /work/check_pods_and_email.sh
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              SMTP_HOST="${SMTP_HOST:-}"
+              SMTP_PORT="${SMTP_PORT:-25}"
+              SMTP_SECURITY="${SMTP_SECURITY:-starttls}"
+              SMTP_USER="${SMTP_USER:-}"
+              SMTP_PASS="${SMTP_PASS:-}"
+
+              EMAIL_TO="${EMAIL_TO:-}"
+              EMAIL_FROM="${EMAIL_FROM:-}"
+              ENVELOPE_FROM="${ENVELOPE_FROM:-}"   # NEW: provided in Secret, required
+              SUBJECT_PREFIX="${SUBJECT_PREFIX:-[OpenShift Pod Health]}"
+              TARGET_NAMESPACES="${TARGET_NAMESPACES:-}"
+
+              # Basic validation
+              if [[ -z "$SMTP_HOST" || -z "$EMAIL_TO" || -z "$EMAIL_FROM" ]]; then
+                echo "Missing required SMTP_HOST/EMAIL_TO/EMAIL_FROM" >&2
+                exit 1
+              fi
+              if [[ -z "$ENVELOPE_FROM" ]]; then
+                echo "Missing ENVELOPE_FROM (plain address). Set it in the Secret." >&2
+                exit 1
+              fi
+              if [[ -z "$TARGET_NAMESPACES" ]]; then
+                echo "TARGET_NAMESPACES is empty. Provide a comma-separated list." >&2
+                exit 1
+              fi
+
+              NOW="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              CLUSTER="$(oc whoami --show-server 2>/dev/null || echo 'unknown')"
+              HEADER="Pod Health Report — ${NOW}\nCluster: ${CLUSTER}\nNamespaces: ${TARGET_NAMESPACES}\n"
+
+              NON_HEALTHY=""
+              SUMMARY=""
+
+              IFS=',' read -ra NAMESPACES <<< "$TARGET_NAMESPACES"
+              for ns in "${NAMESPACES[@]}"; do
+                ns=$(echo "$ns" | xargs)
+                [[ -z "$ns" ]] && continue
+
+                POD_LINES="$(oc get pods -n "$ns" --no-headers 2>/dev/null || true)"
+                if [[ -z "$POD_LINES" ]]; then
+                  SUMMARY+=$'\n'"[$ns] No pods found or access denied."
+                  continue
+                fi
+
+                SUMMARY+=$'\n'"[$ns]"
+                SUMMARY+=$'\n'"$(oc get pods -n "$ns" -o wide)"
+
+                while IFS= read -r line; do
+                  [[ -z "$line" ]] && continue
+                  name=$(echo "$line" | awk '{print $1}')  # ns-scoped: NAME first
+                  ready=$(echo "$line" | awk '{print $2}')
+                  status=$(echo "$line" | awk '{print $3}')
+
+                  if [[ "$ready" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+                    cur="${BASH_REMATCH[1]}"
+                    des="${BASH_REMATCH[2]}"
+                    if [[ "$cur" != "$des" ]]; then
+                      NON_HEALTHY+="$ns $name READY=$ready STATUS=$status"$'\n'
+                    fi
+                  fi
+
+                  if [[ "$status" != "Running" ]]; then
+                    NON_HEALTHY+="$ns $name READY=$ready STATUS=$status"$'\n'
+                  fi
+                done <<< "$POD_LINES"
+              done
+
+              if [[ -n "$NON_HEALTHY" ]]; then
+                NON_HEALTHY="$(printf "%s" "$NON_HEALTHY" | awk '!seen[$0]++')"
+                COUNT=$(printf "%s" "$NON_HEALTHY" | grep -c . || echo 0)
+                SUBJECT="${SUBJECT_PREFIX} ALERT: ${COUNT} pod(s) not healthy"
+                BODY="${HEADER}\nSome pods are not healthy:\n\n$NON_HEALTHY\n\nSummary:\n$SUMMARY"
+              else
+                SUBJECT="${SUBJECT_PREFIX} OK: all pods healthy"
+                BODY="${HEADER}\nAll pods are Running and Ready.\n\nSummary:\n$SUMMARY"
+              fi
+
+              TMP_MSG=$(mktemp)
+              {
+                printf "From: %s\r\n" "$EMAIL_FROM"
+                printf "To: %s\r\n" "$EMAIL_TO"
+                printf "Subject: %s\r\n" "$SUBJECT"
+                printf "MIME-Version: 1.0\r\n"
+                printf "Content-Type: text/plain; charset=UTF-8\r\n"
+                printf "Content-Transfer-Encoding: 8bit\r\n"
+                printf "\r\n"
+                printf "%s" "$BODY" | tr -d '\r' | sed 's/$/\r/'
+              } > "$TMP_MSG"
+
+              URL="smtp://${SMTP_HOST}:${SMTP_PORT}"
+              CURL_TLS_ARGS=()
+              case "$SMTP_SECURITY" in
+                starttls) CURL_TLS_ARGS+=(--ssl-reqd) ;;
+                ssl) URL="smtps://${SMTP_HOST}:${SMTP_PORT}" ;;  # not used here, but supported
+                none) ;;
+                *) echo "Unknown SMTP_SECURITY: $SMTP_SECURITY" >&2; exit 1 ;;
+              esac
+
+              AUTH_ARGS=()
+              if [[ -n "$SMTP_USER" && -n "$SMTP_PASS" ]]; then
+                AUTH_ARGS=(-u "${SMTP_USER}:${SMTP_PASS}")
+              fi
+
+              IFS=',' read -ra RCPTS <<< "$EMAIL_TO"
+              RCPT_ARGS=()
+              for r in "${RCPTS[@]}"; do
+                r=$(echo "$r" | xargs)
+                [[ -n "$r" ]] && RCPT_ARGS+=(--mail-rcpt "$r")
+              done
+
+              set -x
+              curl -sS --url "$URL" \
+                "${AUTH_ARGS[@]}" \
+                "${CURL_TLS_ARGS[@]}" \
+                --mail-from "$ENVELOPE_FROM" \
+                "${RCPT_ARGS[@]}" \
+                --upload-file "$TMP_MSG"
+              set +x
+
+              echo "Report sent: ${SUBJECT}"
+              EOF
+              chmod +x /work/check_pods_and_email.sh
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      containers:
+        - name: reporter
+          image: quay.io/openshift/origin-cli:4.14
+          command: ["bash"]
+          args: ["/work/check_pods_and_email.sh"]
+          envFrom:
+            - secretRef:
+                name: pod-status-smtp-secret
+          volumeMounts:
+            - name: work
+              mountPath: /work

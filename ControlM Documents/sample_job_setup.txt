@@ -1,0 +1,57 @@
+Notes: Please note that this is a cyclic schedule and needs to execute every 10 minutes. The file wactcher should order the load job everytime
+it finds a file
+
+###1.
+ 
+FOLDER_NAME:CROPRODFW
+JOBNAME:AML_EDDINTERNALLIST_FW
+DESCRIPTION:Watch for File /mnt/landing_zone/mft/prod/incoming/croit/actimize_load_s3/V_ACM_INTERNAL_LIST_ITEMS*.csv
+TASKTYPE:File Watcher
+APPLICATION: CROPRODFW
+SUB APPLICATION:CROPRODFW
+DATACENTER:dna-rbctlmpsv01
+HOST: dna-r1abprh01.fnb.co.za
+NODE_ID:ng-dna-abprh01-os
+RUN_AS:svc_ctrlm_abi_prod
+FILE_PATH:/mnt/landing_zone/mft/prod/incoming/croit/actimize_load_s3/
+FILE_NAME:V_ACM_INTERNAL_LIST_ITEMS*.csv
+SEARCH_INTERVAL:
+FILE_SIZE_INTERVAL:
+ITERATIONS:
+TIME_LIMIT:
+BU_NAME:CRO IT Application Support
+DOCMEM:CHG0440549
+RBGCAL:Daily
+TIME_FROM:
+TIME_TO:
+OUTCOND:AML_EDDINTERNALLIST_FW-OK
+RERUN_EVERY:10 minutes
+ONCE_FILE_FOUND:force in AML_EDDINTERNALLIST
+- stop file watcher:Y
+FORCE_JOB:
+
+###2
+PARENT FOLDER:iDnA_CROIT
+JOBNAME:AML_EDDINTERNALLIST
+TASKTYPE:Job
+PARENT FOLDER:iDnA_CROIT
+APPLICATION:DAILY_ETL
+SUB APPLICATION:DAILY_ETL
+DATACENTER:dna-rbctlmpsv01
+NODE_ID: ng-dna-abprh01-os
+FILE_NAME:run_current.sh
+FILE_PATH:/abinitio/bin
+OWNER:svc_croit_abi_prod
+BU_NAME: CRO IT Application Support
+DESCRIPTION:This plan loads EDD list data
+DOCMEM:CHG0440549 
+PARM_NAME:PARM1
+PARM_VALUE:/private_sand/Applications/CROIT/AML/Screening_edd/plan/edd_cloud_internal_list.plan
+TIME_FROM:
+TIME_TO:
+INCOND: AML_EDDINTERNALLIST_FW-OK
+OUTCOND:AML_EDDINTERNALLIST_OK
+RBGCAL: Daily
+
+
+
