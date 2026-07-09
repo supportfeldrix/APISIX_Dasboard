@@ -414,6 +414,88 @@ UAT LDAP service had misaligned timeouts compared to PROD, and was missing the s
 | False alert emails after pod restart | Load-balancer jitter between APISIX pods + empty `_previous_metrics` on restart | Fixed July 2026 — high-water mark evaluation + `_baseline_established` flag skips first cycle |
 | Build fails with `CannotCreateBuildPod` | ResourceQuota `example` added to namespace requires resource limits on build pods | Patch BuildConfig: add `spec.resources` with `limits.cpu=1, limits.memory=1Gi, requests.cpu=250m, requests.memory=256Mi` |
 | 413 on chunked POST requests (RTS/RCM) | APISIX 3.17 `apisix_delay_client_max_body_check on` misinterprets `client_max_body_size 0` as "zero allowed" for chunked bodies | Add `client-control` plugin with `max_body_size: 10485760` to each affected route (fixed UAT July 2026, pending PROD) |
+| Backend OOMKilled when viewing RCM logs | WebSocket exec transfers too much data (RCM log entries are 3-8KB each); 5000 lines = 25-40MB exceeds 512Mi pod limit | Fixed July 2026 — `head -500` limit + memory bump to 768Mi + WebSocket `max_bytes` cap (see section below) |
+| Traffic report shows "No data" for Today | WebSocket "no close frame" timeout when transferring large volumes over K8s exec API | Fixed July 2026 — reduced matching line limit from 5000 to 500 per pod; ~2.5MB transfers reliably within 30s timeout |
+
+## Traffic Report WebSocket OOM & Timeout Fix (July 2026)
+
+### What Was Fixed
+1. Backend pod was OOMKilled (exit 137) when users opened the RCM Log Viewer
+2. Traffic report chart showed "No traffic data found" for Today (but Yesterday worked)
+
+### Root Cause — OOM (512Mi limit exceeded)
+The `_exec_in_pod_ws()` function in `traffic_report_service.py` accumulated ALL stdout data from the K8s WebSocket exec API without any size limit. When the log viewer and traffic report fired concurrently (both reading from large log files), memory usage exceeded the 512Mi pod limit.
+
+### Root Cause — "No data" for Today
+RCM log entries are **3-8KB each** because they contain full multipart request bodies with JWT tokens. The original `head -5000` limit meant the WebSocket had to transfer 5000 × 5KB = **~25MB** of data per pod. The K8s exec WebSocket connection dropped mid-transfer with "no close frame received or sent" error. Yesterday worked because `tac` processes differently and historical data was smaller.
+
+### Fixes Applied (UAT `traffic_report_service.py`)
+
+| Change | Before | After | Why |
+|--------|--------|-------|-----|
+| `_exec_in_pod_ws` max_bytes | No limit | 10MB cap | Prevents OOM — breaks out of read loop when exceeded |
+| `_exec_in_pod_ws` max_size | Default | 10MB per frame | Prevents single large WebSocket frame from blowing memory |
+| WebSocket `open_timeout` | 10s | 15s | More time to establish connection |
+| WebSocket `close_timeout` | 5s | 30s | Allows time for large data to flush before close |
+| WebSocket `ping_timeout` | None | 30s | Keeps connection alive during large transfers |
+| Route log lines (today) | `head -5000` | `tail -500` | Keeps transfer under ~2.5MB per pod (500 × 5KB) |
+| Route log lines (historical) | `head -10000` | `head -500` | Same — limits data volume |
+| Pod memory limit | 512Mi | 768Mi | Extra headroom for Python + concurrent WebSocket reads |
+| Pod memory request | 128Mi | 256Mi | Matches actual baseline usage |
+| Log viewer max lines | 1000 | 500 | Reduces concurrent memory pressure |
+| Log viewer tail depth | `lines * 3` | `min(lines * 5, 5000)` | Caps search depth with explicit limit |
+
+### Key Insight — Log Entry Sizes Vary Wildly by Route
+| Route | Avg Line Size | 500 lines = |
+|-------|---------------|-------------|
+| RTS (realtime-screening.log) | ~1KB | ~500KB ✅ |
+| RCM (rcm-route.log) | 3-8KB | ~2.5MB ✅ |
+| Keycloak (keycloak-access.log) | ~500B | ~250KB ✅ |
+| access.log (raw nginx) | ~200B | ~100KB ✅ |
+
+The `tail -500` limit is conservative enough for RCM (heaviest route) while still providing enough data for meaningful charts. Yesterday's RCM traffic had 103 requests total — 500 lines per pod (1000 total across 2 pods) covers even busy days.
+
+### How the Traffic Report Works (Post-Fix)
+```
+Frontend: GET /api/metrics/traffic-report?route_id=rcm-injecting-jwt&date=2026-07-09&time_from=00:00&time_to=23:59
+    │
+    ▼
+Backend: for each pod in [apisix-uat-0, apisix-uat-1]:
+    │   WebSocket exec → sh -c "tail -20000 <log_file> | grep -a '<route_id>' | tail -500"
+    │   (today: tail grabs last 20k lines, grep filters by route, tail -500 limits output)
+    │   
+    │   OR for historical (days_ago > 0):
+    │   WebSocket exec → sh -c "tac <log_file> | grep -a '<route_id>' | head -500"
+    │   (tac reads file backwards, grep filters, head limits to 500 matches)
+    │
+    ▼
+Backend: Parse JSON lines → extract start_time, latency, response.status
+    │   Filter by target_date and time range
+    │   Group by minute → per_minute counts/latency/statuses
+    │
+    ▼
+Frontend: Render response time chart + outage timeline + error events table
+```
+
+### Files Modified (UAT only — pending PROD promotion)
+| File | Change |
+|------|--------|
+| `backend/app/services/traffic_report_service.py` | Added max_bytes/max_size/timeout caps to WebSocket, reduced line limits to 500 |
+| `backend/app/routers/logs.py` | Reduced max lines to 500, capped tail depth at 5000, added search input sanitisation |
+
+### How to Verify
+1. Open the dashboard → Logs page
+2. Select "RCM - OAuth2" log file
+3. Click "Fetch Logs" — raw log lines should appear
+4. Select "Today" in the chart timeframe → chart should render with data points
+5. Check pod events: `oc describe pod <backend-pod>` — should show 0 OOMKill events
+6. Memory usage: `oc adm top pod <backend-pod>` — should stay well under 768Mi
+
+### If Traffic Report Returns Empty
+1. Check pod logs for "WebSocket exec failed" errors
+2. If "no close frame" persists, further reduce `tail -500` to `tail -200`
+3. If "Timeout exec'ing into pod" appears, the APISIX pod may be unresponsive
+4. Verify APISIX pods are running: `oc get pods -l app=apisix -n cro-apisix-uat`
 
 ## Promoting UAT → PROD
 
@@ -428,6 +510,9 @@ UAT LDAP service had misaligned timeouts compared to PROD, and was missing the s
 | File | Change | Status |
 |------|--------|--------|
 | `backend/app/routers/metrics.py` | Traffic report CSV export uses friendly route name (`ROUTE_NAMES`) instead of raw `route_id`. Also uses friendly name in filename. | Applied to UAT, **not yet applied to PROD** |
+| `backend/app/services/traffic_report_service.py` | WebSocket OOM fix: max_bytes cap, timeout increases, line limit reduced to 500 | Applied to UAT, **not yet applied to PROD** |
+| `backend/app/routers/logs.py` | Log viewer: max lines reduced to 500, tail depth capped at 5000, search input sanitisation | Applied to UAT, **not yet applied to PROD** |
+| Deployment memory limits | Pod memory: requests 256Mi, limits 768Mi (was 128Mi/512Mi) | Applied to UAT, **not yet applied to PROD** |
 | APISIX Route: RTS (secured) | Add `client-control` plugin with `max_body_size: 10485760` to fix 413 on chunked requests | Applied to UAT, **not yet applied to PROD** |
 | APISIX Route: RCM (secured) | Add `client-control` plugin with `max_body_size: 10485760` to fix 413 on chunked requests | Applied to UAT, **not yet applied to PROD** |
 

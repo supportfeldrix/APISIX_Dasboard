@@ -77,11 +77,17 @@ def _get_log_file_for_route(route_id: str) -> str:
     return "access.log"
 
 
-async def _exec_in_pod_ws(pod_name: str, command: List[str]) -> str:
+async def _exec_in_pod_ws(pod_name: str, command: List[str], max_bytes: int = 10 * 1024 * 1024) -> str:
     """Execute a command in an APISIX pod using the K8s exec WebSocket API.
 
     Uses the in-cluster service account token for authentication.
     Returns stdout as a string.
+
+    Args:
+        pod_name: Name of the pod to exec into.
+        command: Command to execute as a list of strings.
+        max_bytes: Maximum bytes to accumulate before stopping (default 50MB).
+                   Prevents OOMKill when reading very large log files.
     """
     namespace = settings.OC_NAMESPACE
 
@@ -114,6 +120,7 @@ async def _exec_in_pod_ws(pod_name: str, command: List[str]) -> str:
     }
 
     stdout_data = []
+    total_bytes = 0
 
     try:
         async with websockets.connect(
@@ -121,8 +128,10 @@ async def _exec_in_pod_ws(pod_name: str, command: List[str]) -> str:
             additional_headers=headers,
             ssl=ssl_context,
             subprotocols=["v4.channel.k8s.io"],
-            open_timeout=10,
-            close_timeout=5,
+            open_timeout=15,
+            close_timeout=30,
+            max_size=10 * 1024 * 1024,  # 10MB max per WebSocket frame
+            ping_timeout=30,
         ) as ws:
             async for message in ws:
                 if isinstance(message, bytes) and len(message) > 1:
@@ -131,6 +140,13 @@ async def _exec_in_pod_ws(pod_name: str, command: List[str]) -> str:
                     channel = message[0]
                     data = message[1:].decode("utf-8", errors="replace")
                     if channel == 1:  # stdout
+                        total_bytes += len(message) - 1
+                        if total_bytes > max_bytes:
+                            logger.warning(
+                                "Exec output exceeded %d MB limit for pod %s, truncating",
+                                max_bytes // (1024 * 1024), pod_name,
+                            )
+                            break
                         stdout_data.append(data)
                     elif channel == 3:  # error/status
                         # Check if it's a success status
@@ -215,22 +231,24 @@ def get_traffic_report(
             log_date_str = date
         if days_ago <= 0:
             # Today: tail for speed, then grep by date
-            grep_cmd = ["sh", "-c", f"tail -50000 {log_path} | grep -a '{log_date_str}'"]
+            grep_cmd = ["sh", "-c", f"tail -20000 {log_path} | grep -a '{log_date_str}' | head -5000"]
         else:
             # Historical: use tac to read from end of file (recent first),
-            # grep by date, limited to 10,000 lines
-            grep_cmd = ["sh", "-c", f"tac {log_path} | grep -a '{log_date_str}' | head -10000"]
+            # grep by date, limited to 5,000 lines
+            grep_cmd = ["sh", "-c", f"tac {log_path} | grep -a '{log_date_str}' | head -5000"]
     else:
-        # For JSON route logs:
-        # - Today: tail recent lines then filter by route (fast, small transfer)
-        # - Historical: use tac (reverse read) to read from end of file backwards,
-        #   then grep for route_id. Since yesterday's data is just before today's
-        #   in the file, this finds it quickly without scanning from the beginning.
-        #   Limited to 10,000 matching lines to prevent timeouts.
+        # For JSON route logs: use tail + grep to get matching lines.
+        # IMPORTANT: RCM entries are 3-8KB each (contain full request bodies with
+        # JWT tokens). Transferring too many lines over WebSocket causes timeouts.
+        # Limit to 500 matching lines (~2.5MB) which transfers reliably within 30s.
+        # For "today": tail from end of file then grep for most recent entries.
+        # For historical: tac (reverse) then grep (finds recent historical data first).
         if days_ago <= 0:
-            grep_cmd = ["sh", "-c", f"tail -20000 {log_path} | grep -a '{route_id}'"]
+            grep_cmd = ["sh", "-c",
+                "tail -20000 " + log_path + " | grep -a '" + route_id + "' | tail -500"]
         else:
-            grep_cmd = ["sh", "-c", f"tac {log_path} | grep -a '{route_id}' | head -10000"]
+            grep_cmd = ["sh", "-c",
+                "tac " + log_path + " | grep -a '" + route_id + "' | head -500"]
 
     per_minute = defaultdict(lambda: {"count": 0, "total_latency": 0.0, "statuses": defaultdict(int)})
     total_requests = 0
