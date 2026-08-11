@@ -113,14 +113,19 @@ async def _exec_in_pod_ws(pod_name: str, command: List[str]) -> str:
 
     stdout_data = []
 
+    max_bytes = 10 * 1024 * 1024  # 10MB cap to prevent OOM
+    total_bytes = 0
+
     try:
         async with websockets.connect(
             url,
             additional_headers=headers,
             ssl=ssl_context,
             subprotocols=["v4.channel.k8s.io"],
-            open_timeout=10,
-            close_timeout=5,
+            open_timeout=15,
+            close_timeout=30,
+            ping_timeout=30,
+            max_size=10 * 1024 * 1024,
         ) as ws:
             async for message in ws:
                 if isinstance(message, bytes) and len(message) > 1:
@@ -130,6 +135,10 @@ async def _exec_in_pod_ws(pod_name: str, command: List[str]) -> str:
                     data = message[1:].decode("utf-8", errors="replace")
                     if channel == 1:  # stdout
                         stdout_data.append(data)
+                        total_bytes += len(message)
+                        if total_bytes >= max_bytes:
+                            logger.warning("Max bytes (%d) reached for pod %s, breaking", max_bytes, pod_name)
+                            break
                     elif channel == 3:  # error/status
                         # Check if it's a success status
                         try:
@@ -212,11 +221,11 @@ def get_traffic_report(
             log_date_str = date
         if days_ago <= 0:
             # Today: tail for speed, then grep by date
-            grep_cmd = ["sh", "-c", f"tail -50000 {log_path} | grep -a '{log_date_str}'"]
+            grep_cmd = ["sh", "-c", f"tail -20000 {log_path} | grep -a '{log_date_str}' | tail -500"]
         else:
             # Historical: use tac to read from end of file (recent first),
-            # grep by date, limited to 10,000 lines
-            grep_cmd = ["sh", "-c", f"tac {log_path} | grep -a '{log_date_str}' | head -10000"]
+            # grep by date, limited to 500 lines
+            grep_cmd = ["sh", "-c", f"tac {log_path} | grep -a '{log_date_str}' | head -500"]
     else:
         # For JSON route logs:
         # - Today: tail recent lines then filter by route (fast, small transfer)
@@ -225,9 +234,9 @@ def get_traffic_report(
         #   in the file, this finds it quickly without scanning from the beginning.
         #   Limited to 10,000 matching lines to prevent timeouts.
         if days_ago <= 0:
-            grep_cmd = ["sh", "-c", f"tail -20000 {log_path} | grep -a '{route_id}'"]
+            grep_cmd = ["sh", "-c", f"tail -20000 {log_path} | grep -a '{route_id}' | tail -500"]
         else:
-            grep_cmd = ["sh", "-c", f"tac {log_path} | grep -a '{route_id}' | head -10000"]
+            grep_cmd = ["sh", "-c", f"tac {log_path} | grep -a '{route_id}' | head -500"]
 
     per_minute = defaultdict(lambda: {"count": 0, "total_latency": 0.0, "statuses": defaultdict(int)})
     total_requests = 0

@@ -100,16 +100,46 @@ export default function RouteUptimeChart({ logLines, fileName }) {
     return null; // Don't render anything if no parseable data
   }
 
-  // Build outage timeline segments
+  // Build outage timeline segments — uses per-minute error rate threshold.
+  // Only marks a minute as "down" if error rate exceeds 10% of that minute's traffic.
+  // This prevents isolated 404s from painting the entire timeline red.
   const timelineSegments = useMemo(() => {
     if (dataPoints.length === 0) return [];
 
+    // Group data points by minute
+    const minuteBuckets = {};
+    for (const point of dataPoints) {
+      const minuteKey = point.time.substring(0, 5); // HH:MM
+      if (!minuteBuckets[minuteKey]) {
+        minuteBuckets[minuteKey] = { total: 0, errors: 0 };
+      }
+      minuteBuckets[minuteKey].total += 1;
+      if (!point.isUp) {
+        minuteBuckets[minuteKey].errors += 1;
+      }
+    }
+
+    // Determine if each minute is "up" based on error rate threshold (10%)
+    const ERROR_RATE_THRESHOLD = 0.10;
+    const minuteStatus = {};
+    for (const [minute, bucket] of Object.entries(minuteBuckets)) {
+      const errorRate = bucket.errors / bucket.total;
+      minuteStatus[minute] = errorRate <= ERROR_RATE_THRESHOLD;
+    }
+
+    // Map each data point to its minute-level status
+    const pointStatuses = dataPoints.map((p) => {
+      const minuteKey = p.time.substring(0, 5);
+      return minuteStatus[minuteKey] !== false; // default to up
+    });
+
+    // Build segments from the minute-level statuses
     const segments = [];
-    let currentStatus = dataPoints[0].isUp;
+    let currentStatus = pointStatuses[0];
     let segStart = 0;
 
     for (let i = 1; i < dataPoints.length; i++) {
-      if (dataPoints[i].isUp !== currentStatus) {
+      if (pointStatuses[i] !== currentStatus) {
         segments.push({
           startIdx: segStart,
           endIdx: i - 1,
@@ -118,7 +148,7 @@ export default function RouteUptimeChart({ logLines, fileName }) {
           endTime: dataPoints[i - 1].time,
         });
         segStart = i;
-        currentStatus = dataPoints[i].isUp;
+        currentStatus = pointStatuses[i];
       }
     }
     // Final segment

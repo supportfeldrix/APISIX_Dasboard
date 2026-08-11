@@ -39,7 +39,7 @@ def get_log_files(current_user: User = Depends(get_current_user)):
 def view_logs(
     file: str = Query(..., description="Log file name (e.g. rcm-route.log)"),
     pod: str = Query("apisix-0", description="Pod name"),
-    lines: int = Query(100, ge=10, le=1000, description="Number of lines to return"),
+    lines: int = Query(100, ge=10, le=500, description="Number of lines to return"),
     search: Optional[str] = Query(None, description="Optional search/filter term"),
     current_user: User = Depends(get_current_user),
 ):
@@ -62,8 +62,11 @@ def view_logs(
 
     # Build command
     if search and search.strip():
-        # tail + grep for filtered view
-        cmd = ["sh", "-c", f"tail -{lines * 3} {log_path} | grep -a '{search}' | tail -{lines}"]
+        # Sanitise search input — remove shell metacharacters
+        safe_search = "".join(c for c in search.strip() if c.isalnum() or c in "._-/ @:=")
+        # tail + grep for filtered view, cap tail depth at 5000
+        tail_depth = min(lines * 5, 5000)
+        cmd = ["sh", "-c", f"tail -{tail_depth} {log_path} | grep -a '{safe_search}' | tail -{lines}"]
     else:
         # Simple tail
         cmd = ["tail", f"-{lines}", log_path]
