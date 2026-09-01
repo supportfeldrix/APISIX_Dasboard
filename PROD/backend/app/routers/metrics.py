@@ -216,12 +216,15 @@ def export_traffic_report_csv(
 
     Columns: Date, Time (HH:MM), Route, Request Count, Avg Latency (ms), 2xx, 4xx, 5xx
     """
-    from app.services.traffic_report_service import get_traffic_report
+    from app.services.traffic_report_service import get_traffic_report, ROUTE_NAMES
 
     result = get_traffic_report(route_id, date, time_from, time_to)
     if "error" in result:
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail=result["error"])
+
+    # Resolve friendly route name for CSV output
+    route_display_name = ROUTE_NAMES.get(route_id, route_id)
 
     # Build CSV
     output = io.StringIO()
@@ -240,7 +243,7 @@ def export_traffic_report_csv(
         writer.writerow([
             date,
             minute["time"],
-            route_id,
+            route_display_name,
             minute["count"],
             minute["avg_latency_ms"],
             count_2xx,
@@ -257,7 +260,7 @@ def export_traffic_report_csv(
     writer.writerow(["Pods Queried", ", ".join(result.get("pods_queried", []))])
 
     output.seek(0)
-    filename = f"traffic_report_{route_id}_{date}.csv"
+    filename = f"traffic_report_{route_display_name}_{date}.csv"
 
     return StreamingResponse(
         iter([output.getvalue()]),

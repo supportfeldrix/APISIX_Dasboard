@@ -385,6 +385,60 @@ export default function RouteUptimePanel({ routes = [], selectedRouteId = '' }) 
   const selectedRoute = routes.find((r) => r.route_id === routeId);
   const routeLabel = selectedRoute?.label || routeId;
 
+  // Export chart data to CSV
+  function exportCsv() {
+    if (!reportData || !chartData || chartData.length === 0) return;
+
+    // Build CSV header
+    const headers = ['Time', 'Requests', 'Avg Latency (ms)', '2xx', '3xx', '4xx', '5xx', 'Has Errors'];
+
+    // Build rows from chartData
+    const rows = chartData.map((point) => {
+      const s = point.statuses || {};
+      const sum2xx = Object.entries(s).filter(([c]) => c.startsWith('2')).reduce((a, [, v]) => a + v, 0);
+      const sum3xx = Object.entries(s).filter(([c]) => c.startsWith('3')).reduce((a, [, v]) => a + v, 0);
+      const sum4xx = Object.entries(s).filter(([c]) => { const n = parseInt(c, 10); return n >= 400 && n <= 499; }).reduce((a, [, v]) => a + v, 0);
+      const sum5xx = Object.entries(s).filter(([c]) => { const n = parseInt(c, 10); return n >= 500 && n <= 599; }).reduce((a, [, v]) => a + v, 0);
+      return [
+        point.time,
+        point.count,
+        point.latency,
+        sum2xx,
+        sum3xx,
+        sum4xx,
+        sum5xx,
+        point.hasErrors ? 'Yes' : 'No',
+      ];
+    });
+
+    // Add summary row
+    rows.push([]);
+    rows.push(['Summary']);
+    rows.push(['Route', routeLabel]);
+    rows.push(['Date Range', reportData.date || '']);
+    rows.push(['Time Range', `${reportData.time_from || ''} - ${reportData.time_to || ''}`]);
+    rows.push(['Total Requests', stats.totalRequests]);
+    rows.push(['Avg Latency (ms)', stats.avgLatency]);
+    rows.push(['Uptime %', stats.uptimePercent]);
+    rows.push(['Error Requests', stats.errorRequests]);
+
+    // Convert to CSV string
+    const csvContent = [
+      headers.join(','),
+      ...rows.map((row) => row.map((cell) => `"${cell}"`).join(',')),
+    ].join('\n');
+
+    // Trigger download
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const dateStr = reportData.date?.replace(/\s—\s/g, '_to_') || 'report';
+    link.href = url;
+    link.download = `traffic_report_${routeLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${dateStr}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div className="bg-white rounded-lg shadow mt-4">
       {/* Header with timeframe controls */}
@@ -518,6 +572,16 @@ export default function RouteUptimePanel({ routes = [], selectedRouteId = '' }) 
                     {stats.errorRequests === 0 ? 'OPERATIONAL' : `${stats.errorRequests} ERRORS`}
                   </span>
                 </div>
+                <button
+                  onClick={exportCsv}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-teal-700 bg-teal-50 border border-teal-200 rounded-md hover:bg-teal-100 transition-colors"
+                  title="Export traffic data to CSV"
+                >
+                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                  </svg>
+                  Export CSV
+                </button>
               </div>
             </div>
           </div>
