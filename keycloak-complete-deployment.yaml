@@ -1,0 +1,282 @@
+# ==============================================================================
+# Complete Keycloak Deployment with PostgreSQL and Realm Import
+# Namespace: cro-apisix-uat
+# ==============================================================================
+
+# 1. PostgreSQL PVC
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-postgres-pvc
+  namespace: cro-apisix-uat
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: dorado-nfs-csi
+  resources:
+    requests:
+      storage: 5Gi
+
+# 2. Keycloak Export/Import PVC
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-export-pvc
+  namespace: cro-apisix-uat
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: dorado-nfs-csi
+  resources:
+    requests:
+      storage: 1Gi
+
+# 3. PostgreSQL Deployment
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-postgres
+  namespace: cro-apisix-uat
+  labels:
+    app: keycloak-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak-postgres
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: keycloak-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: registry.redhat.io/rhel8/postgresql-15:latest
+        imagePullPolicy: IfNotPresent
+        env:
+          - name: POSTGRESQL_DATABASE
+            value: keycloak
+          - name: POSTGRESQL_USER
+            value: keycloak
+          - name: POSTGRESQL_PASSWORD
+            value: keycloakpass
+        ports:
+          - containerPort: 5432
+            protocol: TCP
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+        volumeMounts:
+          - mountPath: /var/lib/pgsql/data
+            name: postgres-storage
+        livenessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - pg_isready -U keycloak
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        readinessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - pg_isready -U keycloak
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: keycloak-postgres-pvc
+
+# 4. PostgreSQL Service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-postgres
+  namespace: cro-apisix-uat
+  labels:
+    app: keycloak-postgres
+spec:
+  selector:
+    app: keycloak-postgres
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5432
+  type: ClusterIP
+
+# 5. Keycloak Deployment
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: cro-apisix-uat
+  labels:
+    app: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      terminationGracePeriodSeconds: 90
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:26.0.0
+        imagePullPolicy: IfNotPresent
+        args:
+          - start
+          - --hostname=cro-apisix-keycloak-uat.apps.dev-02-rb.ocp.fnb.co.za
+          - --hostname-strict=false
+          - --proxy-headers=xforwarded
+          - --http-enabled=true
+          - --health-enabled=true
+          - --metrics-enabled=true
+          - --import-realm
+        env:
+          - name: KC_BOOTSTRAP_ADMIN_USERNAME
+            value: admin
+          - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+            value: admin123
+          - name: KC_DB
+            value: postgres
+          - name: KC_DB_URL
+            value: jdbc:postgresql://keycloak-postgres:5432/keycloak
+          - name: KC_DB_USERNAME
+            value: keycloak
+          - name: KC_DB_PASSWORD
+            value: keycloakpass
+          - name: KC_LOG_LEVEL
+            value: INFO
+        ports:
+          - containerPort: 8080
+            name: http
+            protocol: TCP
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        startupProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          initialDelaySeconds: 30
+          failureThreshold: 40
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: http
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 6
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 15"]
+        volumeMounts:
+          - name: keycloak-import
+            mountPath: /opt/keycloak/data/import
+            subPath: latest
+      volumes:
+        - name: keycloak-import
+          persistentVolumeClaim:
+            claimName: keycloak-export-pvc
+
+# 6. Keycloak Service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: cro-apisix-uat
+  labels:
+    app: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+      name: http
+  type: ClusterIP
+
+# 7. Keycloak Headless Service (for clustering if scaling >1)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-headless
+  namespace: cro-apisix-uat
+  labels:
+    app: keycloak
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: keycloak
+  ports:
+    - port: 7600
+      name: jgroups
+      protocol: TCP
+
+# 8. Keycloak Route
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: keycloak
+  namespace: cro-apisix-uat
+  labels:
+    app: keycloak
+spec:
+  host: cro-apisix-keycloak-uat.apps.dev-02-rb.ocp.fnb.co.za
+  to:
+    kind: Service
+    name: keycloak
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

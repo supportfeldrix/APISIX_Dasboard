@@ -1,0 +1,86 @@
+# ==============================================================================
+# Keycloak Weekly Export CronJob
+# Namespace: cro-apisix-uat
+# Schedule: Every Sunday at 03:00 UTC
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: keycloak-cli-export-weekly
+  namespace: cro-apisix-uat
+spec:
+  schedule: "0 3 * * 0"  # Every Sunday at 03:00 UTC
+  concurrencyPolicy: Forbid
+  suspend: false
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      creationTimestamp: null
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 0
+      template:
+        metadata:
+          creationTimestamp: null
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 30
+          dnsPolicy: ClusterFirst
+          schedulerName: default-scheduler
+          securityContext:
+            runAsNonRoot: true
+            fsGroup: 1000930000
+          volumes:
+            - name: export-volume
+              persistentVolumeClaim:
+                claimName: keycloak-export-pvc
+          containers:
+            - name: keycloak
+              image: quay.io/keycloak/keycloak:26.4.6
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - '-c'
+              args:
+                - |
+                  set -e
+                  
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)
+                  EXPORT_DIR="/opt/keycloak/data/import/$TS"
+                  
+                  echo "📁 Creating export directory: $EXPORT_DIR"
+                  mkdir -p "$EXPORT_DIR"
+                  
+                  echo "🚀 Starting Keycloak CLI export into $EXPORT_DIR"
+                  /opt/keycloak/bin/kc.sh export \
+                    --dir "$EXPORT_DIR" \
+                    --users realm_file
+                  
+                  echo "🔄 Updating 'latest' symlink"
+                  rm -f /opt/keycloak/data/import/latest
+                  ln -s "$TS" /opt/keycloak/data/import/latest
+                  
+                  echo "✅ Export finished successfully: $TS"
+              env:
+                - name: KC_DB
+                  value: postgres
+                - name: KC_DB_URL
+                  value: jdbc:postgresql://keycloak-postgres:5432/keycloak
+                - name: KC_DB_USERNAME
+                  value: keycloak
+                - name: KC_DB_PASSWORD
+                  value: keycloakpass
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: '1'
+                  memory: 1Gi
+              volumeMounts:
+                - name: export-volume
+                  mountPath: /opt/keycloak/data/import
+              terminationMessagePath: /dev/termination-log
+              terminationMessagePolicy: File

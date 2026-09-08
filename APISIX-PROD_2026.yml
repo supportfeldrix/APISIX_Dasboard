@@ -1,0 +1,541 @@
+
+# ================================
+# ConfigMap: apisix-config (prod)
+# ================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apisix-config
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix
+data:
+  config.yaml: |
+    # --- Admin (v3 schema) ---
+    deployment:
+      admin:
+        admin_key_required: true
+        admin_api_version: v3
+        enable_admin_cors: true
+        enable_admin_ui: true
+        admin_key:
+          - name: "admin"
+            key: yuJuRquLpqMJhXsIzyWlOCWeQTbMAOGi
+            role: admin
+          - name: "viewer"
+            key: 4054f7cf07e344346cd3f287985e76a2
+            role: viewer
+        # prod: permissive ranges so router/node traffic reaches Admin.
+        # After it works, replace with the minimal CIDR(s) you observe in access.log.
+        allow_admin:
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+          - 127.0.0.0/8
+        admin_listen:
+          ip: 0.0.0.0
+          port: 9180
+
+    # --- Legacy admin section (kept; not authoritative for Admin API in v3) ---
+    apisix:
+      node_listen: 9080
+      enable_ipv6: false
+      enable_prod_mode: false
+
+      enable_admin_ui: true
+      # Placeholders will be replaced by init container from Secret
+      admin_key:
+        - name: "admin"
+          key: ${ADMIN_KEY}
+          role: admin
+        - name: "viewer"
+          key: ${VIEWER_KEY}
+          role: viewer
+
+      # Control API (leave enabled; we can use it for probes later if desired)
+      enable_control: true
+      control:
+        ip: "0.0.0.0"
+        port: 9092
+
+      ssl:
+        enable: false
+    authentication:
+    issuerMapping:
+    "http://cro-apisix-keycloak-prod.apps.prod-01-rb.ocp.fnb.co.za:9080/realms/actimize": "https://cro-apisix-keycloak-prod.apps.prod-01-rb.ocp.fnb.co.za/realms/actimize/protocol/openid-connect/certs"
+
+    etcd:
+      host:
+        - "http://apisix-etcd.cro-apisix-prod.svc.cluster.local:2379"
+      prefix: "/apisix"
+      timeout: 30
+
+    plugin_attr:
+      prometheus:
+        export_addr:
+          ip: "0.0.0.0"
+          port: 9091
+---
+# ======================================
+# ConfigMap: apisix-mime-types (prod)
+# ======================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apisix-mime-types
+  namespace: cro-apisix-prod
+  labels: { app: apisix }
+data:
+  mime.types: |
+    types {
+      text/html html htm shtml;
+      text/css css;
+      application/json json;
+      image/png png;
+      image/jpeg jpeg jpg;
+      application/javascript js;
+    }
+---
+# ====================================================
+# ConfigMap: appd-controller-info  (prod)
+# ====================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: appd-controller-info
+  namespace: cro-apisix-prod
+data:
+  controller-info.xml: |
+    <?xml version="1.0" encoding="UTF-8"?>
+    <controller-info>
+      <controller-host>fnb-prod.saas.appdynamics.com</controller-host>
+      <controller-port>443</controller-port>
+      <controller-ssl-enabled>true</controller-ssl-enabled>
+      <account-name>fnb-prod</account-name>
+      <account-access-key>adde6ec3-dc86-4dce-89d9-19e86ab8f78a</account-access-key>
+      <application-name>CRO-APISIX-prod</application-name>
+      <tier-name>APISIX-Gateway</tier-name>
+      <node-name>apisix-prod-01</node-name>
+      <sim-enabled>false</sim-enabled>
+      <prometheus-enabled>true</prometheus-enabled>
+    </controller-info>
+---
+# =========================================================
+# ConfigMap: appd-prometheus-config  (prod)
+# =========================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: appd-prometheus-config
+  namespace: cro-apisix-prod
+data:
+  prometheus-config.yaml: |
+    prometheus:
+      scrape_interval: 15s
+      scrape_timeout: 10s
+      enabled: true
+    exporters:
+      - name: apisix
+        url: http://apisix-0.apisix.cro-apisix-prod.svc.cluster.local:9091
+        metrics_path: /apisix/prometheus/metrics
+        labels:
+          application: CRO-APISIX-prod
+          tier: APISIX-Gateway
+---
+# =========================
+# Secret: apisix-admin-keys
+# =========================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: apisix-admin-keys
+  namespace: cro-apisix-prod
+type: Opaque
+data:
+  ADMIN_KEY: ZWRkMWM5ZjAzNDMzNWYxMzZmODdhZDg0YjYyNWM4ZjE=
+  VIEWER_KEY: NDA1NGY3Y2YwN2UzNDQzNDZjZDNmMjg3OTg1ZTc2YTI=
+---
+# ==============================
+# Secret: apisix-oidc-secrets
+# ==============================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: apisix-oidc-secrets
+  namespace: cro-apisix-prod
+type: Opaque
+data:
+  ACTIMIZE_CLIENT_SECRET: Vk9RZTR6M2NUMVhWRkQ5RUl3UDF4Q1IxbnJQVGxya2U=
+---
+# ===============================
+# Secret: appd-controller-secret
+# ===============================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: appd-controller-secret
+  namespace: cro-apisix-prod
+type: Opaque
+data:
+  APPDYNAMICS_AGENT_ACCOUNT_ACCESS_KEY: YWRkZTZlYzMtZGM4Ni00ZGNlLTg5ZDktMTllODZhYjhmNzhh
+---
+# ==================================
+# StatefulSet: etcd (prod)  — as provided
+# ==================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: apisix-etcd
+  namespace: cro-apisix-prod
+  labels:
+    app.kubernetes.io/component: database
+    app.kubernetes.io/created-by: username
+    app.kubernetes.io/instance: apisix-etcd-prod
+    app.kubernetes.io/managed-by: lumos-team
+    app.kubernetes.io/name: apisix-etcd
+    app.kubernetes.io/part-of: apisix
+    app.kubernetes.io/version: v3.5.23
+spec:
+  serviceName: apisix-etcd
+  revisionHistoryLimit: 10
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app: apisix-etcd
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: etcd-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 1Gi } }
+        storageClassName: dorado-nfs-csi
+        volumeMode: Filesystem
+  template:
+    metadata:
+      labels:
+        app: apisix-etcd
+    spec:
+      containers:
+        - name: apisix-etcd
+          image: quay.io/coreos/etcd:v3.5.23
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/etcd"]
+          args:
+            - "--logger=zap"
+            - "--data-dir=/bitnami/etcd"
+          env:
+            - { name: TZ,                        value: Africa/Johannesburg }
+            - { name: ETCD_ENABLE_V2,            value: "true" }
+            - { name: ALLOW_NONE_AUTHENTICATION, value: "yes" }
+            - { name: ETCD_LISTEN_CLIENT_URLS,   value: "http://0.0.0.0:2379" }
+            - { name: ETCD_ADVERTISE_CLIENT_URLS,value: "http://apisix-etcd.cro-apisix-prod.svc.cluster.local:2379" }
+          ports:
+            - { name: listen, containerPort: 2379, protocol: TCP }
+          resources:
+            requests: { cpu: 10m,  memory: 200Mi }
+            limits:   { memory: 200Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: etcd-data, mountPath: /bitnami/etcd }
+          terminationMessagePath: /prod/termination-log
+          terminationMessagePolicy: File
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      schedulerName: default-scheduler
+---
+# =============================
+# Service: etcd client (prod)
+# =============================
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix-etcd
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix-etcd
+    app.kubernetes.io/component: apisix-etcd
+    app.kubernetes.io/instance: apisix-etcd
+spec:
+  type: ClusterIP
+  selector:
+    app: apisix-etcd
+  ports:
+    - name: 2379-tcp
+      port: 2379
+      targetPort: 2379
+---
+# ==================================
+# StatefulSet: apisix (prod) — canary + probes
+# ==================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: apisix
+  namespace: cro-apisix-prod
+spec:
+  selector:
+    matchLabels:
+      app: apisix
+  serviceName: apisix
+  replicas: 2
+  revisionHistoryLimit: 10
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+
+  # Keep your canary behavior
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 1
+
+  volumeClaimTemplates:
+    - metadata: { name: apisix-logs }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 1Gi } }
+        storageClassName: dorado-nfs-csi
+        volumeMode: Filesystem
+
+  template:
+    metadata:
+      labels:
+        app: apisix
+    spec:
+      securityContext:
+        fsGroup: 1000930000
+        seccompProfile: { type: RuntimeDefault }
+      restartPolicy: Always
+
+      # Init #1: wait for etcd to be ready
+      initContainers:
+        - name: wait-for-etcd
+          image: busybox
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              echo 'Waiting for etcd to be ready...'
+              until wget -q -O- http://apisix-etcd.cro-apisix-prod.svc.cluster.local:2379/health 2>/dev/null | grep -q 'true'; do
+                echo "etcd not ready yet, waiting..."
+                sleep 2
+              done
+              echo 'etcd is ready!'
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+
+        # Init #2: wait for ConfigMap file to exist
+        - name: wait-for-config
+          image: busybox
+          imagePullPolicy: IfNotPresent
+          command: ["sh","-c","echo 'Waiting for /bootstrap/config.yaml...'; while [ ! -s /bootstrap/config.yaml ]; do sleep 1; done"]
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            - { name: apisix-config, mountPath: /bootstrap }
+
+        # Init #2: copy + substitute placeholders with Secret values (FIXED)
+        - name: bootstrap-config
+          image: registry.access.redhat.com/ubi8/ubi-minimal
+          command:
+            - sh
+            - -c
+            - |
+              set -euo pipefail
+              # Create conf directory if it doesn't exist
+              mkdir -p /usr/local/apisix/conf
+              # Escape & / for safe sed replacement
+              ADMIN_ESC=$(printf '%s' "${ADMIN_KEY}"  | sed -e 's/[\/&]/\\&/g')
+              VIEWER_ESC=$(printf '%s' "${VIEWER_KEY}" | sed -e 's/[\/&]/\\&/g')
+              sed -e "s#\${ADMIN_KEY}#${ADMIN_ESC}#g" \
+                  -e "s#\${VIEWER_KEY}#${VIEWER_ESC}#g" \
+                  /bootstrap/config.yaml > /usr/local/apisix/conf/config.yaml
+              chmod 0644 /usr/local/apisix/conf/config.yaml
+          env:
+            - name: ADMIN_KEY
+              valueFrom:
+                secretKeyRef: { name: apisix-admin-keys, key: ADMIN_KEY }
+            - name: VIEWER_KEY
+              valueFrom:
+                secretKeyRef: { name: apisix-admin-keys, key: VIEWER_KEY }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            - { name: apisix-config, mountPath: /bootstrap }
+            - { name: apisix-conf-emptydir, mountPath: /usr/local/apisix/conf }
+
+      containers:
+        - name: apisix
+          image: apache/apisix:3.16.0-redhat
+          imagePullPolicy: Always
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            limits:   { cpu: "1", memory: 3Gi }
+            requests: { cpu: 250m, memory: 2Gi }
+          env:
+            - { name: TZ, value: Africa/Johannesburg }
+            - { name: APISIX_DEPLOYMENT_ETCD_HOST, value: '["http://apisix-etcd.cro-apisix-prod.svc.cluster.local:2379"]' }
+            - name: ACTIMIZE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: apisix-oidc-secrets, key: ACTIMIZE_CLIENT_SECRET }
+
+          ports:
+            - { name: http,       containerPort: 9080 }
+            - { name: admin,      containerPort: 9180 }  # embedded UI via Service/Route on 9180
+            - { name: control,    containerPort: 9092 }
+            - { name: prometheus, containerPort: 9091 }
+
+          # Probes use the control API (9092) — avoids 403/404 on admin/proxy ports during bring-up.
+          startupProbe:
+            httpGet:
+              path: /v1/healthcheck
+              port: 9092
+            failureThreshold: 30
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /v1/healthcheck
+              port: 9092
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/healthcheck
+              port: 9092
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+          volumeMounts:
+            - { name: apisix-conf-emptydir, mountPath: /usr/local/apisix/conf }
+            - { name: apisix-logs, mountPath: /usr/local/apisix/logs }
+            - { name: apisix-mime-types, mountPath: /usr/local/apisix/conf/mime.types, subPath: mime.types }
+            - { name: oidc-secret, mountPath: /etc/apisix/secrets, readOnly: true }
+            - { name: apisix-temp-emptydir, mountPath: /usr/local/apisix/client_body_temp }
+            - { name: apisix-temp-emptydir, mountPath: /usr/local/apisix/proxy_temp }
+            - { name: apisix-temp-emptydir, mountPath: /usr/local/apisix/fastcgi_temp }
+            - { name: apisix-temp-emptydir, mountPath: /usr/local/apisix/uwsgi_temp }
+            - { name: apisix-temp-emptydir, mountPath: /usr/local/apisix/scgi_temp }
+
+        # Your AppDynamics sidecar (unchanged)
+        - name: appdynamics-agent
+          image: appdynamics/machine-agent:26.1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits:    { cpu: "500m", memory: "1Gi" }
+          env:
+            - { name: APPDYNAMICS_CONTROLLER_HOST_NAME, value: "fnb-prod.saas.appdynamics.com" }
+            - { name: APPDYNAMICS_CONTROLLER_PORT, value: "443" }
+            - { name: APPDYNAMICS_CONTROLLER_SSL_ENABLED, value: "true" }
+            - { name: APPDYNAMICS_AGENT_ACCOUNT_NAME, value: "fnb-prod" }
+            - name: APPDYNAMICS_AGENT_ACCOUNT_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: appd-controller-secret, key: APPDYNAMICS_AGENT_ACCOUNT_ACCESS_KEY }
+            - { name: APPDYNAMICS_AGENT_APPLICATION_NAME, value: "CRO-APISIX-prod" }
+            - { name: APPDYNAMICS_AGENT_TIER_NAME, value: "APISIX-Gateway" }
+            - { name: MACHINE_AGENT_PROPERTIES, value: "-Dappdynamics.agent.logs.dir=/tmp/appd-logs" }
+            - name: APPDYNAMICS_AGENT_NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+          volumeMounts:
+            - { name: appd-controller-info,   mountPath: /opt/appdynamics/conf/controller-info.xml, subPath: controller-info.xml, readOnly: true }
+            - { name: appd-prometheus-config, mountPath: /opt/appdynamics/conf/prometheus, readOnly: true }
+            - { name: appd-logs,              mountPath: /tmp/appd-logs }
+
+      volumes:
+        - { name: apisix-config,          configMap: { name: apisix-config } }
+        - { name: apisix-mime-types,      configMap: { name: apisix-mime-types } }
+        - { name: appd-controller-info,   configMap: { name: appd-controller-info } }
+        - { name: appd-prometheus-config, configMap: { name: appd-prometheus-config } }
+        - { name: oidc-secret,            secret: { secretName: apisix-oidc-secrets } }
+        - { name: appd-logs,              emptyDir: {} }
+        - { name: apisix-conf-emptydir,   emptyDir: {} }
+        - { name: apisix-temp-emptydir,   emptyDir: {} }
+---
+# ===============================
+# Service: apisix (prod)
+# ===============================
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix
+  namespace: cro-apisix-prod
+  labels:
+    app: apisix
+    app.kubernetes.io/component: apisix
+    app.kubernetes.io/instance: apisix
+spec:
+  type: ClusterIP
+  selector:
+    app: apisix
+  ports:
+    - name: 9080-tcp
+      port: 9080
+      targetPort: 9080
+---
+# ==========================================
+# Service: apisix-dashboard (prod embedded)
+# ==========================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix-dashboard
+  namespace: cro-apisix-prod
+  labels:
+    app.kubernetes.io/component: admin-ui
+    app.kubernetes.io/part-of: apisix
+spec:
+  type: ClusterIP
+  selector:
+    app: apisix
+  ports:
+    - name: admin-ui
+      port: 9180
+      targetPort: 9180
+# =============================================================================
+# NOTE: OpenShift Routes (apisix-external, apisix-internal, apisix-embedded-dashboard)
+# are managed directly on the cluster and NOT included in this manifest.
+# This prevents accidental certificate overwrites during oc apply.
+#
+# To manage routes, use:
+#   oc get routes -n cro-apisix-prod
+#   oc apply -f route-cert-patch.yaml  (for external route cert updates)
+# =============================================================================
+
