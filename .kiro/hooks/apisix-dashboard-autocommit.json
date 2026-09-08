@@ -1,0 +1,15 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "APISIX Dashboard Auto Commit & Push",
+      "trigger": "Stop",
+      "description": "Commits any changes in the APISIX_Dashboard repo and pushes to both remotes (FNB + private GitHub) when an agent task completes.",
+      "action": {
+        "type": "command",
+        "command": "git -C \"c:\\Users\\F5151422\\OneDrive - FRG\\Desktop\\APISIX_Dashboard\" add -A && (git -C \"c:\\Users\\F5151422\\OneDrive - FRG\\Desktop\\APISIX_Dashboard\" diff --cached --quiet || git -C \"c:\\Users\\F5151422\\OneDrive - FRG\\Desktop\\APISIX_Dashboard\" commit -m \"Auto-commit from Kiro hook\") && git -C \"c:\\Users\\F5151422\\OneDrive - FRG\\Desktop\\APISIX_Dashboard\" push origin HEAD",
+        "timeout": 120
+      }
+    }
+  ]
+}
