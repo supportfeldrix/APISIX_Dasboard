@@ -1,0 +1,5 @@
+# OpenShift CLI binary — too large for GitHub (100MB limit), download separately
+oc/oc.exe
+PROD/oc/oc.exe
+UAT/oc/oc.exe
+**/oc.exe
