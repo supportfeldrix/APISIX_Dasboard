@@ -3,3 +3,16 @@ oc/oc.exe
 PROD/oc/oc.exe
 UAT/oc/oc.exe
 **/oc.exe
+# Python build artifacts — compiled bytecode, regenerated automatically
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment / secrets
+*.env.local
