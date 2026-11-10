@@ -11,7 +11,17 @@ from pydantic import BaseModel
 
 from app.models.user import User
 from app.services.auth_service import get_current_user
-from app.services.metrics_service import fetch_metrics, parse_prometheus, parse_apisix_metrics
+from app.services.metrics_service import (
+    fetch_metrics,
+    parse_prometheus,
+    parse_apisix_metrics,
+    parse_route_requests_per_pod,
+    parse_route_latency,
+    parse_route_nodes,
+)
+from app.services.traffic_trend_service import get_trend
+from app.database import get_db
+from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -76,6 +86,185 @@ def get_route_metrics(current_user: User = Depends(get_current_user)):
         "routes": routes,
         "total_routes": len(routes),
     }
+
+
+@router.get("/metrics/routes/by-pod")
+def get_route_metrics_by_pod(current_user: User = Depends(get_current_user)):
+    """Get per-route request counts broken down by APISIX pod.
+
+    Each APISIX pod keeps its own independent Prometheus counters. Scraping the
+    apisix-metrics Service only returns one (arbitrary) pod's counters per request,
+    so this endpoint scrapes each pod's IP directly and returns the breakdown.
+
+    Returns a list of routes, each with a per-pod and a combined total breakdown.
+    """
+    per_pod_routes = parse_route_requests_per_pod()
+    route_names = _get_route_names()
+
+    # Discover the full set of pod names seen across all routes for a stable column order.
+    pod_names = sorted({
+        pod_name
+        for route in per_pod_routes
+        for pod_name in route.get("per_pod", {}).keys()
+    })
+
+    routes = []
+    for route in per_pod_routes:
+        route_id = route["route_id"]
+        per_pod = route.get("per_pod", {})
+
+        pods_breakdown = {}
+        combined_total = 0
+        combined_by_status: Dict[str, int] = {}
+
+        for pod_name in pod_names:
+            data = per_pod.get(pod_name)
+            if not data:
+                continue
+            total = int(data.get("total", 0))
+            by_status = {k: int(v) for k, v in data.get("by_status", {}).items()}
+            success = int(sum(v for k, v in by_status.items() if k.startswith("2")))
+            client_err = int(sum(v for k, v in by_status.items() if k.startswith("4")))
+            server_err = int(sum(v for k, v in by_status.items() if k.startswith("5")))
+
+            pods_breakdown[pod_name] = {
+                "total_requests": total,
+                "by_status": by_status,
+                "success_count": success,
+                "count_4xx": client_err,
+                "count_5xx": server_err,
+            }
+
+            combined_total += total
+            for k, v in by_status.items():
+                combined_by_status[k] = combined_by_status.get(k, 0) + v
+
+        combined_success = int(sum(v for k, v in combined_by_status.items() if k.startswith("2")))
+        combined_4xx = int(sum(v for k, v in combined_by_status.items() if k.startswith("4")))
+        combined_5xx = int(sum(v for k, v in combined_by_status.items() if k.startswith("5")))
+
+        routes.append({
+            "route_id": route_id,
+            "route_name": route_names.get(route_id, route_id),
+            "pods": pods_breakdown,
+            "combined": {
+                "total_requests": combined_total,
+                "success_count": combined_success,
+                "count_4xx": combined_4xx,
+                "count_5xx": combined_5xx,
+            },
+        })
+
+    routes.sort(key=lambda r: r["combined"]["total_requests"], reverse=True)
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pods": pod_names,
+        "routes": routes,
+        "total_routes": len(routes),
+    }
+
+
+@router.get("/metrics/routes/latency")
+def get_route_latency(current_user: User = Depends(get_current_user)):
+    """Get per-route latency percentiles (p50/p95/p99) estimated from histograms.
+
+    Returns total request latency, upstream (backend) latency, and APISIX
+    (gateway overhead) latency in milliseconds for each route. Percentiles are
+    estimated from the apisix_http_latency histogram buckets with interpolation.
+    """
+    raw = fetch_metrics()
+    latency = parse_route_latency(raw)
+    route_names = _get_route_names()
+
+    routes = []
+    for route_id, types in latency.items():
+        total = types.get("request", {})
+        routes.append({
+            "route_id": route_id,
+            "route_name": route_names.get(route_id, route_id),
+            "request": types.get("request", {}),
+            "upstream": types.get("upstream", {}),
+            "apisix": types.get("apisix", {}),
+            "count": int(total.get("count", 0)),
+        })
+
+    routes.sort(key=lambda r: r["count"], reverse=True)
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "routes": routes,
+        "total_routes": len(routes),
+        "note": "Percentiles are histogram-bucket estimates (interpolated), not exact values.",
+    }
+
+
+@router.get("/metrics/routes/nodes")
+def get_route_nodes(
+    route_id: Optional[str] = Query(None, description="Filter to a single route"),
+    current_user: User = Depends(get_current_user),
+):
+    """Get per-route, per-upstream-node traffic and status breakdown.
+
+    Shows which backend node IPs are receiving traffic for each route and how they
+    are responding (status code breakdown + bandwidth). This provides an upstream
+    node view from the `node` label on status/bandwidth metrics — it does not
+    require active health checks to be configured on the upstreams.
+    """
+    raw = fetch_metrics()
+    route_nodes = parse_route_nodes(raw)
+    route_names = _get_route_names()
+
+    routes = []
+    for rid, nodes in route_nodes.items():
+        if route_id and rid != route_id:
+            continue
+        node_list = []
+        for node_ip, data in nodes.items():
+            by_status = data.get("by_status", {})
+            total = int(data.get("total", 0))
+            c2 = int(sum(v for k, v in by_status.items() if k.startswith("2")))
+            c4 = int(sum(v for k, v in by_status.items() if k.startswith("4")))
+            c5 = int(sum(v for k, v in by_status.items() if k.startswith("5")))
+            node_list.append({
+                "node": node_ip,
+                "total_requests": total,
+                "count_2xx": c2,
+                "count_4xx": c4,
+                "count_5xx": c5,
+                "success_rate": round((c2 / total) * 100, 1) if total > 0 else 0.0,
+                "bandwidth_ingress": int(data.get("bandwidth_ingress", 0)),
+                "bandwidth_egress": int(data.get("bandwidth_egress", 0)),
+            })
+        node_list.sort(key=lambda n: n["total_requests"], reverse=True)
+        routes.append({
+            "route_id": rid,
+            "route_name": route_names.get(rid, rid),
+            "nodes": node_list,
+            "node_count": len(node_list),
+        })
+
+    routes.sort(key=lambda r: sum(n["total_requests"] for n in r["nodes"]), reverse=True)
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "routes": routes,
+        "total_routes": len(routes),
+    }
+
+
+@router.get("/metrics/routes/trend")
+def get_route_trend(
+    route_id: str = Query(..., description="Route id/name to chart"),
+    hours: int = Query(1, ge=1, le=24, description="Lookback window in hours"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get a per-interval traffic trend (requests + error rate) for one route.
+
+    Built from periodic snapshots captured by the background scheduler, so history
+    accumulates over time. Deltas between consecutive snapshots give requests and
+    errors per interval; counter resets are clamped to zero.
+    """
+    return get_trend(db, route_id=route_id, hours=hours)
 
 
 @router.get("/metrics/routes/csv")

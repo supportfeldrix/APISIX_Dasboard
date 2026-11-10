@@ -36,6 +36,7 @@ from app.services.notification_service import (
 from app.services.controlm_escalation_service import escalation_service
 from app.services.pod_health_evaluator import evaluate_pod_health
 from app.services.version_check_service import version_check_service
+from app.services.traffic_trend_service import capture_snapshot, purge_old_snapshots
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +343,15 @@ class BackgroundScheduler:
             # Step 2: Load enabled alert rules
             db = SessionLocal()
             try:
+                # Step 2a: Capture a traffic snapshot for trend charting (best-effort,
+                # independent of alert rules so trends populate even with no rules).
+                try:
+                    written = capture_snapshot(db)
+                    logger.debug("Traffic snapshot captured for %d routes", written)
+                    purge_old_snapshots(db)
+                except Exception as exc:
+                    logger.error("Error capturing traffic snapshot: %s", exc)
+
                 rules = get_rules(db, enabled_only=True)
 
                 if not rules:

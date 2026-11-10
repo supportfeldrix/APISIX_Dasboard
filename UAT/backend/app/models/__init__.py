@@ -6,3 +6,4 @@ from .version_check import VersionCheckResult  # noqa: F401
 from .escalation_state import EscalationState  # noqa: F401
 from .escalation_log import EscalationLog  # noqa: F401
 from .controlm_settings import ControlMSettings  # noqa: F401
+from .route_traffic_snapshot import RouteTrafficSnapshot  # noqa: F401

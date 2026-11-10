@@ -64,13 +64,13 @@ def get_system_info(current_user: User = Depends(get_current_user)):
     """Return system information for audit and compliance."""
     return {
         "application": {
-            "name": "CRO IT APISIX Dashboard",
+            "name": "RST IT APISIX Dashboard",
             "version": APP_VERSION,
             "build_date": APP_BUILD_DATE,
             "environment": os.environ.get("APP_ENVIRONMENT", "PROD"),
             "description": "Custom APISIX API Gateway management dashboard",
-            "owner": "CRO IT",
-            "contact": "CRO IT Team",
+            "owner": "RST IT",
+            "contact": "RST IT Team",
         },
         "runtime": {
             "python_version": platform.python_version(),

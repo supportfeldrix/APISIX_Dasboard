@@ -155,4 +155,4 @@ curl -k https://<DASHBOARD-HOSTNAME>/health
 
 ---
 
-*Created: 2026-05-15 | CRO IT — APISIX Dashboard PROD Setup*
+*Created: 2026-05-15 | RST IT — APISIX Dashboard PROD Setup*

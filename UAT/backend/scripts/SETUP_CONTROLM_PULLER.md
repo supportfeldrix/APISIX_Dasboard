@@ -163,7 +163,7 @@ Provide the ControlM team with this specification:
 | SEARCH_INTERVAL | 1 minute |
 | MIN_FILE_AGE | 5 seconds |
 | ON_FOUND | Trigger phone-call escalation to 1st call / standby |
-| BU_NAME | CRO IT Application Support |
+| BU_NAME | RST IT Application Support |
 
 ## Testing End-to-End
 

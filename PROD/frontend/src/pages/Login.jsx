@@ -49,14 +49,14 @@ export default function Login() {
           <div className="mb-12 bg-white rounded-2xl p-6 shadow-lg">
             <img
               src={apisixLogo}
-              alt="CRO IT APISIX Dashboard"
+              alt="RST IT APISIX Dashboard"
               className="w-64 h-64 object-contain"
             />
           </div>
 
           {/* Title */}
           <h2 className="text-3xl font-bold text-center mb-2">
-            CRO IT
+            RST IT
           </h2>
           <p className="text-lg text-red-200 text-center mb-10">
             APISIX Dashboard
@@ -175,17 +175,17 @@ export default function Login() {
           {/* Footer */}
           <div className="mt-8 p-3 bg-gray-100 rounded-md border border-gray-200">
             <p className="text-xs text-gray-500 text-center leading-relaxed">
-              <strong>AUTHORIZED USE ONLY.</strong> This system is the property of FNB / CRO IT.
+              <strong>AUTHORIZED USE ONLY.</strong> This system is the property of FNB / RST IT.
               Unauthorized access is prohibited and may be subject to disciplinary action and/or prosecution.
               All activities are monitored and logged for security purposes.
             </p>
           </div>
 
           <p className="mt-4 text-center text-xs text-gray-400">
-            CRO IT APISIX Dashboard &middot; FNB &copy; {new Date().getFullYear()}
+            RST IT APISIX Dashboard &middot; FNB &copy; {new Date().getFullYear()}
           </p>
           <p className="mt-1 text-center text-xs text-gray-400">
-            Created by CRO IT
+            Created by RST IT
           </p>
         </div>
       </div>

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { AreaChart, Area, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import useMetrics from '../hooks/useMetrics';
 import apiClient from '../api/client';
 
@@ -14,6 +14,18 @@ function Monitoring() {
   const [restartingPods, setRestartingPods] = useState(new Set());
   const [routeMetrics, setRouteMetrics] = useState([]);
   const [routeMetricsLoading, setRouteMetricsLoading] = useState(true);
+  const [routePods, setRoutePods] = useState([]);
+  const [routePodMetrics, setRoutePodMetrics] = useState([]);
+  // Latency percentiles keyed by route_id
+  const [latencyByRoute, setLatencyByRoute] = useState({});
+  // Per-upstream-node breakdown keyed by route_id
+  const [nodesByRoute, setNodesByRoute] = useState({});
+  const [expandedNodeRoute, setExpandedNodeRoute] = useState(null);
+  // Traffic trend chart
+  const [trendRoute, setTrendRoute] = useState('');
+  const [trendHours, setTrendHours] = useState(1);
+  const [trendData, setTrendData] = useState(null);
+  const [trendLoading, setTrendLoading] = useState(false);
   const [trafficReport, setTrafficReport] = useState(null);
   const [trafficLoading, setTrafficLoading] = useState(false);
   const [trafficRoute, setTrafficRoute] = useState('');
@@ -48,12 +60,43 @@ function Monitoring() {
 
   async function fetchRouteMetrics() {
     try {
-      const response = await apiClient.get('/metrics/routes');
-      setRouteMetrics(response.data.routes || []);
+      const [aggRes, byPodRes, latencyRes, nodesRes] = await Promise.all([
+        apiClient.get('/metrics/routes'),
+        apiClient.get('/metrics/routes/by-pod').catch(() => ({ data: { pods: [], routes: [] } })),
+        apiClient.get('/metrics/routes/latency').catch(() => ({ data: { routes: [] } })),
+        apiClient.get('/metrics/routes/nodes').catch(() => ({ data: { routes: [] } })),
+      ]);
+      setRouteMetrics(aggRes.data.routes || []);
+      setRoutePods(byPodRes.data.pods || []);
+      setRoutePodMetrics(byPodRes.data.routes || []);
+
+      const latMap = {};
+      (latencyRes.data.routes || []).forEach((r) => { latMap[r.route_id] = r; });
+      setLatencyByRoute(latMap);
+
+      const nodeMap = {};
+      (nodesRes.data.routes || []).forEach((r) => { nodeMap[r.route_id] = r.nodes || []; });
+      setNodesByRoute(nodeMap);
     } catch (err) {
       console.error('Failed to fetch route metrics:', err);
     } finally {
       setRouteMetricsLoading(false);
+    }
+  }
+
+  async function fetchTrend(routeId, hours) {
+    if (!routeId) return;
+    setTrendLoading(true);
+    try {
+      const res = await apiClient.get('/metrics/routes/trend', {
+        params: { route_id: routeId, hours },
+      });
+      setTrendData(res.data);
+    } catch (err) {
+      console.error('Failed to fetch trend:', err);
+      setTrendData(null);
+    } finally {
+      setTrendLoading(false);
     }
   }
 
@@ -361,7 +404,120 @@ function Monitoring() {
 
         {routeMetricsLoading ? (
           <div className="px-6 py-8 text-center text-gray-500">Loading route metrics...</div>
+        ) : routePodMetrics.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Route</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Pod</th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">Total Hits</th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">2xx</th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">4xx</th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">5xx</th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">Success Rate</th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {routePodMetrics.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-8 text-center text-sm text-gray-500">
+                      No route traffic data available
+                    </td>
+                  </tr>
+                ) : (
+                  routePodMetrics.map((route) => {
+                    // One sub-row per pod that served this route, plus a combined total row.
+                    const podEntries = Object.entries(route.pods || {});
+                    const rowCount = podEntries.length + 1; // pods + combined
+                    const combined = route.combined || {};
+                    const combinedRate = combined.total_requests > 0
+                      ? ((combined.success_count / combined.total_requests) * 100).toFixed(1)
+                      : '0.0';
+
+                    const renderRateBadge = (rate) => (
+                      <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                        parseFloat(rate) >= 99 ? 'bg-green-100 text-green-800' :
+                        parseFloat(rate) >= 95 ? 'bg-yellow-100 text-yellow-800' :
+                        'bg-red-100 text-red-800'
+                      }`}>
+                        {rate}%
+                      </span>
+                    );
+
+                    return (
+                      <React.Fragment key={route.route_id}>
+                        {podEntries.map(([podName, data], idx) => {
+                          const rate = data.total_requests > 0
+                            ? ((data.success_count / data.total_requests) * 100).toFixed(1)
+                            : '0.0';
+                          return (
+                            <tr key={`${route.route_id}-${podName}`} className="hover:bg-gray-50">
+                              {idx === 0 && (
+                                <td
+                                  className="px-4 py-3 text-sm align-top border-r border-gray-100"
+                                  rowSpan={rowCount}
+                                >
+                                  <div className="font-medium text-gray-900">{route.route_name}</div>
+                                  <div className="text-xs text-gray-500">ID: {route.route_id}</div>
+                                </td>
+                              )}
+                              <td className="px-4 py-3 text-xs font-mono text-gray-600">{podName}</td>
+                              <td className="px-4 py-3 text-sm text-right font-semibold text-gray-900">
+                                {data.total_requests.toLocaleString()}
+                              </td>
+                              <td className="px-4 py-3 text-sm text-right text-green-700">
+                                {data.success_count.toLocaleString()}
+                              </td>
+                              <td className="px-4 py-3 text-sm text-right text-yellow-700">
+                                {data.count_4xx.toLocaleString()}
+                              </td>
+                              <td className="px-4 py-3 text-sm text-right text-red-700">
+                                {data.count_5xx.toLocaleString()}
+                              </td>
+                              <td className="px-4 py-3 text-sm text-right">
+                                {renderRateBadge(rate)}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {/* Combined total across pods */}
+                        <tr className="bg-gray-50 font-medium">
+                          {podEntries.length === 0 && (
+                            <td
+                              className="px-4 py-3 text-sm align-top border-r border-gray-100"
+                              rowSpan={1}
+                            >
+                              <div className="font-medium text-gray-900">{route.route_name}</div>
+                              <div className="text-xs text-gray-500">ID: {route.route_id}</div>
+                            </td>
+                          )}
+                          <td className="px-4 py-3 text-xs uppercase tracking-wide text-gray-500">All pods</td>
+                          <td className="px-4 py-3 text-sm text-right font-bold text-gray-900">
+                            {(combined.total_requests || 0).toLocaleString()}
+                          </td>
+                          <td className="px-4 py-3 text-sm text-right text-green-800 font-semibold">
+                            {(combined.success_count || 0).toLocaleString()}
+                          </td>
+                          <td className="px-4 py-3 text-sm text-right text-yellow-800 font-semibold">
+                            {(combined.count_4xx || 0).toLocaleString()}
+                          </td>
+                          <td className="px-4 py-3 text-sm text-right text-red-800 font-semibold">
+                            {(combined.count_5xx || 0).toLocaleString()}
+                          </td>
+                          <td className="px-4 py-3 text-sm text-right">
+                            {renderRateBadge(combinedRate)}
+                          </td>
+                        </tr>
+                      </React.Fragment>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
         ) : (
+          /* Fallback: aggregate (single-pod) view when per-pod data is unavailable */
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gray-50">
@@ -421,6 +577,238 @@ function Monitoring() {
             </table>
           </div>
         )}
+      </div>
+
+      {/* Route Latency Percentiles */}
+      <div className="bg-white rounded-lg shadow overflow-hidden">
+        <div className="px-6 py-4 border-b border-gray-200">
+          <h3 className="text-lg font-semibold text-gray-800">Route Latency (Percentiles)</h3>
+          <p className="text-sm text-gray-500 mt-1">
+            p50 / p95 / p99 response time per route, estimated from APISIX latency histograms.
+            Total = end-to-end, Upstream = backend time, Gateway = APISIX overhead. Values are cumulative since the counters last reset.
+          </p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase" rowSpan={2}>Route</th>
+                <th className="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase border-l border-gray-100" colSpan={3}>Total (ms)</th>
+                <th className="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase border-l border-gray-100" colSpan={3}>Upstream (ms)</th>
+                <th className="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase border-l border-gray-100" colSpan={3}>Gateway (ms)</th>
+              </tr>
+              <tr className="text-[10px] text-gray-400">
+                {['Total', 'Upstream', 'Gateway'].map((grp) => (
+                  <React.Fragment key={grp}>
+                    <th className="px-2 py-1 text-right font-medium border-l border-gray-100">p50</th>
+                    <th className="px-2 py-1 text-right font-medium">p95</th>
+                    <th className="px-2 py-1 text-right font-medium">p99</th>
+                  </React.Fragment>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-gray-200">
+              {Object.keys(latencyByRoute).length === 0 ? (
+                <tr><td colSpan={10} className="px-4 py-8 text-center text-sm text-gray-500">No latency data available</td></tr>
+              ) : (
+                Object.values(latencyByRoute)
+                  .sort((a, b) => (b.count || 0) - (a.count || 0))
+                  .map((r) => {
+                    const cell = (v) => (v != null ? Math.round(v).toLocaleString() : '—');
+                    const p99total = r.request?.p99 || 0;
+                    return (
+                      <tr key={r.route_id} className="hover:bg-gray-50">
+                        <td className="px-4 py-3 text-sm">
+                          <div className="font-medium text-gray-900">{r.route_name}</div>
+                          <div className="text-xs text-gray-500">{(r.count || 0).toLocaleString()} reqs</div>
+                        </td>
+                        <td className={`px-2 py-3 text-sm text-right border-l border-gray-100 ${p99total >= 2000 ? 'text-red-700 font-semibold' : 'text-gray-700'}`}>{cell(r.request?.p50)}</td>
+                        <td className="px-2 py-3 text-sm text-right text-gray-700">{cell(r.request?.p95)}</td>
+                        <td className={`px-2 py-3 text-sm text-right ${p99total >= 2000 ? 'text-red-700 font-semibold' : 'text-gray-700'}`}>{cell(r.request?.p99)}</td>
+                        <td className="px-2 py-3 text-sm text-right text-gray-600 border-l border-gray-100">{cell(r.upstream?.p50)}</td>
+                        <td className="px-2 py-3 text-sm text-right text-gray-600">{cell(r.upstream?.p95)}</td>
+                        <td className="px-2 py-3 text-sm text-right text-gray-600">{cell(r.upstream?.p99)}</td>
+                        <td className="px-2 py-3 text-sm text-right text-gray-500 border-l border-gray-100">{cell(r.apisix?.p50)}</td>
+                        <td className="px-2 py-3 text-sm text-right text-gray-500">{cell(r.apisix?.p95)}</td>
+                        <td className="px-2 py-3 text-sm text-right text-gray-500">{cell(r.apisix?.p99)}</td>
+                      </tr>
+                    );
+                  })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Upstream Node Breakdown */}
+      <div className="bg-white rounded-lg shadow overflow-hidden">
+        <div className="px-6 py-4 border-b border-gray-200">
+          <h3 className="text-lg font-semibold text-gray-800">Upstream Nodes</h3>
+          <p className="text-sm text-gray-500 mt-1">
+            Per backend node traffic and status breakdown for each route. Click a route to expand its upstream nodes.
+            (Live up/down status requires active health checks on the upstreams — not yet enabled.)
+          </p>
+        </div>
+        <div className="divide-y divide-gray-200">
+          {Object.keys(nodesByRoute).length === 0 ? (
+            <div className="px-6 py-8 text-center text-sm text-gray-500">No upstream node data available</div>
+          ) : (
+            Object.entries(nodesByRoute)
+              .filter(([, nodes]) => nodes.length > 0)
+              .sort((a, b) => b[1].reduce((s, n) => s + n.total_requests, 0) - a[1].reduce((s, n) => s + n.total_requests, 0))
+              .map(([routeId, nodes]) => {
+                const routeName = (routeMetrics.find((r) => r.route_id === routeId)?.route_name) || routeId;
+                const expanded = expandedNodeRoute === routeId;
+                const totalReq = nodes.reduce((s, n) => s + n.total_requests, 0);
+                return (
+                  <div key={routeId}>
+                    <button
+                      onClick={() => setExpandedNodeRoute(expanded ? null : routeId)}
+                      className="w-full px-6 py-3 flex items-center justify-between hover:bg-gray-50 text-left"
+                    >
+                      <div>
+                        <span className="text-sm font-medium text-gray-900">{routeName}</span>
+                        <span className="ml-2 text-xs text-gray-500">{nodes.length} node{nodes.length !== 1 ? 's' : ''} · {totalReq.toLocaleString()} reqs</span>
+                      </div>
+                      <svg className={`h-4 w-4 text-gray-400 transition-transform ${expanded ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                      </svg>
+                    </button>
+                    {expanded && (
+                      <div className="overflow-x-auto bg-gray-50">
+                        <table className="min-w-full divide-y divide-gray-200 text-sm">
+                          <thead>
+                            <tr className="text-xs text-gray-500 uppercase">
+                              <th className="px-6 py-2 text-left">Node (backend IP)</th>
+                              <th className="px-4 py-2 text-right">Requests</th>
+                              <th className="px-4 py-2 text-right">2xx</th>
+                              <th className="px-4 py-2 text-right">4xx</th>
+                              <th className="px-4 py-2 text-right">5xx</th>
+                              <th className="px-4 py-2 text-right">Success</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-200">
+                            {nodes.map((n) => (
+                              <tr key={n.node} className="bg-white">
+                                <td className="px-6 py-2 font-mono text-xs text-gray-700">{n.node}</td>
+                                <td className="px-4 py-2 text-right font-semibold text-gray-900">{n.total_requests.toLocaleString()}</td>
+                                <td className="px-4 py-2 text-right text-green-700">{n.count_2xx.toLocaleString()}</td>
+                                <td className="px-4 py-2 text-right text-yellow-700">{n.count_4xx.toLocaleString()}</td>
+                                <td className="px-4 py-2 text-right text-red-700">{n.count_5xx.toLocaleString()}</td>
+                                <td className="px-4 py-2 text-right">
+                                  <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                                    n.success_rate >= 99 ? 'bg-green-100 text-green-800' :
+                                    n.success_rate >= 95 ? 'bg-yellow-100 text-yellow-800' :
+                                    'bg-red-100 text-red-800'
+                                  }`}>{n.success_rate}%</span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+          )}
+        </div>
+      </div>
+
+      {/* Traffic Trend Chart */}
+      <div className="bg-white rounded-lg shadow overflow-hidden">
+        <div className="px-6 py-4 border-b border-gray-200">
+          <h3 className="text-lg font-semibold text-gray-800">Traffic Trend</h3>
+          <p className="text-sm text-gray-500 mt-1">
+            Requests and error rate per interval, built from periodic snapshots. History accumulates while the dashboard runs.
+          </p>
+        </div>
+        <div className="px-6 py-4 space-y-4">
+          <div className="flex flex-wrap gap-3 items-end">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">Route</label>
+              <select
+                value={trendRoute}
+                onChange={(e) => { setTrendRoute(e.target.value); }}
+                className="px-3 py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none min-w-[220px]"
+              >
+                <option value="">Select route...</option>
+                {routeMetrics.map((r) => (
+                  <option key={r.route_id} value={r.route_id}>{r.route_name}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">Window</label>
+              <select
+                value={trendHours}
+                onChange={(e) => setTrendHours(parseInt(e.target.value, 10))}
+                className="px-3 py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+              >
+                <option value={1}>Last 1 hour</option>
+                <option value={3}>Last 3 hours</option>
+                <option value={6}>Last 6 hours</option>
+                <option value={12}>Last 12 hours</option>
+                <option value={24}>Last 24 hours</option>
+              </select>
+            </div>
+            <button
+              onClick={() => fetchTrend(trendRoute, trendHours)}
+              disabled={!trendRoute || trendLoading}
+              className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {trendLoading ? 'Loading...' : 'Show Trend'}
+            </button>
+          </div>
+
+          {trendData && !trendLoading && (
+            trendData.points.length === 0 ? (
+              <p className="text-sm text-gray-500 text-center py-6">
+                No snapshots yet for this window. Snapshots are captured every evaluation cycle — check back in a few minutes.
+              </p>
+            ) : (
+              <div className="space-y-6">
+                <div>
+                  <p className="text-xs font-medium text-gray-500 uppercase mb-2">Requests per interval</p>
+                  <div className="h-56">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={trendData.points.map((p) => ({ ...p, t: new Date(p.time).toLocaleTimeString() }))}>
+                        <defs>
+                          <linearGradient id="reqFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#4f46e5" stopOpacity={0.5} />
+                            <stop offset="95%" stopColor="#4f46e5" stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="t" tick={{ fontSize: 10 }} minTickGap={30} />
+                        <YAxis tick={{ fontSize: 11 }} />
+                        <Tooltip />
+                        <Area type="monotone" dataKey="requests" stroke="#4f46e5" fill="url(#reqFill)" name="Requests" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs font-medium text-gray-500 uppercase mb-2">Error rate (%) and p95 latency (ms)</p>
+                  <div className="h-56">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={trendData.points.map((p) => ({ ...p, t: new Date(p.time).toLocaleTimeString() }))}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="t" tick={{ fontSize: 10 }} minTickGap={30} />
+                        <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
+                        <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} />
+                        <Tooltip />
+                        <Legend />
+                        <Line yAxisId="left" type="monotone" dataKey="error_rate" stroke="#dc2626" dot={false} name="Error rate %" />
+                        <Line yAxisId="right" type="monotone" dataKey="p95_ms" stroke="#059669" dot={false} name="p95 latency (ms)" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              </div>
+            )
+          )}
+        </div>
       </div>
 
       {/* Traffic Report Section */}

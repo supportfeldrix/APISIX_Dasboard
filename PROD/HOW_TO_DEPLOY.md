@@ -448,4 +448,4 @@ User Browser
 
 ---
 
-*Document created: 2026-05-13 | CRO IT — APISIX Dashboard v1.0.0*
+*Document created: 2026-05-13 | RST IT — APISIX Dashboard v1.0.0*
